@@ -124,6 +124,7 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  while (1){ //Chat
     if (NRF24_DataReady())  // Check if data is ready to be received
     {
         NRF24_Receive(receivedData);  // Read the data into the buffer
@@ -134,13 +135,12 @@ int main(void)
         // Toggle the green LED to indicate successful reception
         BSP_LED_Toggle(LED_GREEN);
     }
+  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
 }
   /* USER CODE END 3 */
-}
-
 /**
   * @brief System Clock Configuration
   * @retval None
