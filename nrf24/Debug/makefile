@@ -60,8 +60,8 @@ all: main-build
 main-build: nrf24.elf secondary-outputs
 
 # Tool invocations
-nrf24.elf nrf24.map: $(OBJS) $(USER_OBJS) C:\Users\andre\Desktop\ISC07-Telemetry\nrf24\STM32G431RBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "nrf24.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\andre\Desktop\ISC07-Telemetry\nrf24\STM32G431RBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="nrf24.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group
+nrf24.elf nrf24.map: $(OBJS) $(USER_OBJS) C:\Users\andre\Desktop\Universidad\ICAI\3\IS\pastillero\IFS07-TE\nrf24\STM32G431RBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "nrf24.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\andre\Desktop\Universidad\ICAI\3\IS\pastillero\IFS07-TE\nrf24\STM32G431RBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="nrf24.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

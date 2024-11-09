@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include "nrf24.h"
+#include "nrf24.c"
 
 /* USER CODE END Includes */
 
@@ -79,6 +80,7 @@ uint8_t TxAddress[6] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7}; //MSB
 float data_buffer[8];
 uint16_t Id[8] = {1584, 1568, 1552, 1600, 1616, 1632, 1648, 1664};
 uint16_t id;
+uint8_t receivedData[32];
 float data1[] = {0x610, 1.23, 4.56, 7.89, 0.12, 3.45, 6.78};
 float data2[] = {0x600, 10.11, 12.13, 14.15, 16.17, 18.19, 20.21, 22.23};
 float data3[] = {0x630, 23.24, 25.26};
@@ -87,7 +89,7 @@ float data5[] = {0x650, 31.32, 33.34, 35.36, 37.38};
 float data6[] = {0x670, 38.39, 40.41, 42.43, 44.45};
 float data7[] = {0x660, 45.46, 47.48, 49.50, 51.52};
 float data8[] = {0x680, 52.53, 54.55, 56.57, 58.59};
-
+int OPMODE;
 /* USER CODE END 0 */
 
 /**
@@ -125,8 +127,10 @@ int main(void)
 
   NRF24_Init();
   NRF24_TxMode(TxAddress, 100);
+  NRF24_RxMode(TxAddress, 100);
 
   int i = 0;
+  int OPMODE = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -137,15 +141,29 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  //OPMODE configura la placa en modo transmisor o receptor, pulsar 5 segundos para cambiar de modo a receptor
+	  uint32_t button_press_start = HAL_GetTick();
+	    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) { // B1 is pressed
+	        // Espera hasta que el botón se mantenga presionado
+	        while (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
+	            if ((HAL_GetTick() - button_press_start) >= 5000) { // 5 segundos
+	                OPMODE = (OPMODE == 0) ? 1 : 0; // Cambiar entre 0 y 1
+	                break;
+	            }
+	        }
+	        HAL_Delay(500); // Anti-rebote del botón
+	    }
 	  // Enviar diferentes paquetes de datos
 	  //id = chooseRandomNumber(Id, 8);
 	  //generate_data(id, data_buffer);
+	  if (OPMODE==0){
 	  float *data[] = {data1, data2, data3, data4, data5, data6, data7, data8};
 
 	  if (NRF24_Transmit(data[i]) == 1) {
 	  			  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
 	  			  i++;
-	  			  HAL_Delay(300);
+	  			  HAL_Delay(3000);
+	  			  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
 	  			  if(HAL_GPIO_ReadPin(GPIOC,GPIO_PIN_13)){
 	  				  break;
 	  			  }
@@ -166,9 +184,20 @@ int main(void)
 
 	  }
 	  HAL_Delay(1000);*/
-  }
+	  }
+	  else if (OPMODE==1){
+		        NRF24_Receive(receivedData);  // Read the data into the buffer
+		        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+		        // Transmit the received data over UART
+		        HAL_UART_Transmit(&hlpuart1, receivedData, sizeof(receivedData), HAL_MAX_DELAY);
+		        HAL_Delay(3000);
+		        // Toggle the green LED to indicate successful reception
+		        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+		    }
+		  }
+	  }
   /* USER CODE END 3 */
-}
+
 
 /**
   * @brief System Clock Configuration
