@@ -34,7 +34,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define HEX_CHARS      "0123456789ABCDEF"
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -62,7 +62,8 @@ static void MX_SPI2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+uint8_t RxAddress[6] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};  // NRF24 receiver address
+uint8_t receivedData[32];  // Buffer to store received data
 /* USER CODE END 0 */
 
 /**
@@ -97,7 +98,18 @@ int main(void)
   MX_LPUART1_UART_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
-
+  NRF24_Init();
+  NRF24_RxMode(RxAddress, 100);
+  BspCOMInit.BaudRate   = 115200;
+  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
+  BspCOMInit.StopBits   = COM_STOPBITS_1;
+  BspCOMInit.Parity     = COM_PARITY_NONE;
+  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+  BSP_LED_Init(LED_GREEN);
+  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -107,6 +119,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	if (NRF24_DataReady()){
+		NRF24_Receive(receivedData);
+		HAL_UART_Transmit(&hlpuart1, receivedData, sizeof(receivedData), HAL_MAX_DELAY);
+		BSP_LED_Toggle(LED_GREEN);
+
+
+	}
   }
   /* USER CODE END 3 */
 }
