@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include "nrf24.h"
+#include "bsp.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -100,13 +102,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
   NRF24_Init();
   NRF24_RxMode(RxAddress, 100);
-  BspCOMInit.BaudRate   = 115200;
-  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
-  BspCOMInit.StopBits   = COM_STOPBITS_1;
-  BspCOMInit.Parity     = COM_PARITY_NONE;
-  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+
   BSP_LED_Init(LED_GREEN);
-  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
+
   {
     Error_Handler();
   }

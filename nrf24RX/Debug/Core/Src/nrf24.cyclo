@@ -1,0 +1,17 @@
+../Core/Src/nrf24.c:35:6:CS_Select	1
+../Core/Src/nrf24.c:40:6:CS_UnSelect	1
+../Core/Src/nrf24.c:46:6:CE_Enable	1
+../Core/Src/nrf24.c:51:6:CE_Disable	1
+../Core/Src/nrf24.c:59:6:nrf24_WriteReg	1
+../Core/Src/nrf24.c:75:6:nrf24_WriteRegMulti	1
+../Core/Src/nrf24.c:92:9:nrf24_ReadReg	1
+../Core/Src/nrf24.c:110:6:nrf24_ReadReg_Multi	1
+../Core/Src/nrf24.c:124:6:nrfsendCmd	1
+../Core/Src/nrf24.c:135:6:nrf24_reset	3
+../Core/Src/nrf24.c:183:6:NRF24_Init	1
+../Core/Src/nrf24.c:223:6:NRF24_TxMode	1
+../Core/Src/nrf24.c:246:9:NRF24_Transmit	3
+../Core/Src/nrf24.c:283:6:NRF24_RxMode	1
+../Core/Src/nrf24.c:323:9:isDataAvailable	3
+../Core/Src/nrf24.c:339:6:NRF24_Receive	1
+../Core/Src/nrf24.c:365:6:NRF24_ReadAll	3
