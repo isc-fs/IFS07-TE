@@ -102,8 +102,6 @@ int main(void)
   NRF24_Init();
   NRF24_RxMode(RxAddress, 100);
 
-  HAL_GPIO_PIN_INIT(LED_GIO_PORT, &GPIO_InitStruct);
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -113,7 +111,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (NRF24_DataReady()) {
+	  if (isDataAvailable(0)) {
 	              NRF24_Receive((uint8_t*)receivedData);  // Cast to uint8_t* for compatibility
 
 	              // Print received float values
@@ -122,8 +120,6 @@ int main(void)
 	                  sprintf(msg, "Data[%d]: %.2f\n", i, receivedData[i]); // @suppress("Float formatting support")
 	                  HAL_UART_Transmit(&hlpuart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 	              }
-
-	              HAL_GPIO_TogglePin(LED_GPIO_PORT,LED_GREEN);  // Toggle LED to indicate data reception
 	          }
   }
   /* USER CODE END 3 */
