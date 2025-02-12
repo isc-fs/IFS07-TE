@@ -25,7 +25,6 @@
 #include <stdlib.h>
 #include <time.h>
 #include "nrf24.h"
-#include "bsp.h"
 
 /* USER CODE END Includes */
 
@@ -65,7 +64,7 @@ static void MX_SPI2_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 uint8_t RxAddress[6] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};  // NRF24 receiver address
-uint8_t receivedData[32];  // Buffer to store received data
+float receivedData[32];  // Buffer to store received data
 /* USER CODE END 0 */
 
 /**
@@ -103,11 +102,8 @@ int main(void)
   NRF24_Init();
   NRF24_RxMode(RxAddress, 100);
 
-  BSP_LED_Init(LED_GREEN);
+  HAL_GPIO_PIN_INIT(LED_GIO_PORT, &GPIO_InitStruct);
 
-  {
-    Error_Handler();
-  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -117,13 +113,18 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	if (NRF24_DataReady()){
-		NRF24_Receive(receivedData);
-		HAL_UART_Transmit(&hlpuart1, receivedData, sizeof(receivedData), HAL_MAX_DELAY);
-		BSP_LED_Toggle(LED_GREEN);
+	  if (NRF24_DataReady()) {
+	              NRF24_Receive((uint8_t*)receivedData);  // Cast to uint8_t* for compatibility
 
+	              // Print received float values
+	              for (int i = 0; i < 8; i++) {
+	                  char msg[50];
+	                  sprintf(msg, "Data[%d]: %.2f\n", i, receivedData[i]); // @suppress("Float formatting support")
+	                  HAL_UART_Transmit(&hlpuart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+	              }
 
-	}
+	              HAL_GPIO_TogglePin(LED_GPIO_PORT,LED_GREEN);  // Toggle LED to indicate data reception
+	          }
   }
   /* USER CODE END 3 */
 }
