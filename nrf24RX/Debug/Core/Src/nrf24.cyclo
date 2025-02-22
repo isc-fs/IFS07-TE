@@ -13,5 +13,5 @@
 ../Core/Src/nrf24.c:246:9:NRF24_Transmit	3
 ../Core/Src/nrf24.c:283:6:NRF24_RxMode	1
 ../Core/Src/nrf24.c:323:9:isDataAvailable	3
-../Core/Src/nrf24.c:339:6:NRF24_Receive	1
-../Core/Src/nrf24.c:365:6:NRF24_ReadAll	3
+../Core/Src/nrf24.c:340:6:NRF24_Receive	1
+../Core/Src/nrf24.c:366:6:NRF24_ReadAll	3

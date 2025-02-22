@@ -324,6 +324,7 @@ uint8_t isDataAvailable (int pipenum)
 {
 	uint8_t status = nrf24_ReadReg(STATUS);
 
+
 	if ((status&(1<<6))&&(status&(pipenum<<1)))
 	{
 
