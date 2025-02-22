@@ -63,6 +63,7 @@ static void MX_SPI2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+char uart_msg[100];
 uint8_t RxAddress[6] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};  // NRF24 receiver address
 float receivedData[32];  // Buffer to store received data
 /* USER CODE END 0 */
@@ -101,6 +102,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
   NRF24_Init();
   NRF24_RxMode(RxAddress, 100);
+  nrf24_WriteRegMulti(RX_ADDR_P0, RxAddress, 5);
 
   /* USER CODE END 2 */
 
@@ -111,16 +113,44 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (isDataAvailable(0)) {
-	              NRF24_Receive((uint8_t*)receivedData);  // Cast to uint8_t* for compatibility
+	  print("Encendido");
+      uint8_t status = nrf24_ReadReg(STATUS);
+      print(status);
+      uint8_t pipe_number = (status >> 1) & 0x07;
+      print(pipe_number);
 
-	              // Print received float values
-	              for (int i = 0; i < 8; i++) {
-	                  char msg[50];
-	                  sprintf(msg, "Data[%d]: %.2f\n", i, receivedData[i]); // @suppress("Float formatting support")
-	                  HAL_UART_Transmit(&hlpuart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-	              }
+	  if (isDataAvailable(2)) {  // Check for data on pipe 2 (or any pipe)
+	          // Read the STATUS register
+	          uint8_t status = nrf24_ReadReg(STATUS);
+
+	          // Extract the pipe number (RX_P_NO bits 1:3)
+	          uint8_t pipe_number = (status >> 1) & 0x07;
+
+	          // Print the pipe number
+	          char pipe_msg[50];
+	          sprintf(pipe_msg, "Data received from Pipe: %d\n", pipe_number);
+	          HAL_UART_Transmit(&hlpuart1, (uint8_t*)pipe_msg, strlen(pipe_msg), HAL_MAX_DELAY);
+
+	          // Receive the data
+	          NRF24_Receive((uint8_t*)receivedData);
+
+	          // Print received float values
+	          for (int i = 0; i < 8; i++) {
+	              char msg[50];
+	              sprintf(msg, "Data[%d]: %.2f\n", i, receivedData[i]); // @suppress("Float formatting support")
+	              HAL_UART_Transmit(&hlpuart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 	          }
+
+	          // Clear the RX_DR bit in the STATUS register
+	          nrf24_WriteReg(STATUS, (1 << 6));  // Clear RX_DR bit
+	      } else {
+	          // Print a message if no data is available
+	          HAL_UART_Transmit(&hlpuart1, (uint8_t*)"No data available\n", 18, HAL_MAX_DELAY);
+
+	      }
+
+	      // Add a small delay to avoid flooding the UART
+	      HAL_Delay(100);
   }
   /* USER CODE END 3 */
 }
@@ -312,7 +342,10 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+void print(char uart_buffer[]){
+	sprintf(uart_msg, "%s \n\r", uart_buffer);
+	HAL_UART_Transmit(&hlpuart1,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
+}
 /* USER CODE END 4 */
 
 /**
