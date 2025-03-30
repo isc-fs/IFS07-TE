@@ -2,45 +2,24 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Código actualizado para el receptor NRF24 sin usar formato de float
+  *                   en printf. Se utiliza una función auxiliar para convertir floats.
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * Nota: Se ha implementado la función floatToString para evitar el uso de "%.2f".
+  * Esto es útil si no se ha habilitado el soporte para formateo de float.
   *
   ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "nrf24.h"
-
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-#define HEX_CHARS      "0123456789ABCDEF"
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef hlpuart1;
@@ -48,8 +27,8 @@ SPI_HandleTypeDef hspi2;
 
 /* USER CODE BEGIN PV */
 char uart_msg[100];
-uint8_t RxAddress[6] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};  // NRF24 receiver address
-float receivedData[8];  // Buffer to store received data (8 floats)
+uint8_t RxAddress[6] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};  // Dirección del receptor NRF24
+float receivedData[8];  // Buffer para almacenar los datos recibidos (8 floats)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,17 +36,18 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_SPI2_Init(void);
+
 /* USER CODE BEGIN PFP */
-void print(char uart_buffer[]);
+void print(const char *uart_buffer);
 void printHex(uint8_t value);
 void printAddress(uint8_t *address, uint8_t size);
 void printPayload(float *data, uint8_t size);
+void floatToString(float value, char *buffer);
 /* USER CODE END PFP */
 
-/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void print(char uart_buffer[]) {
-    sprintf(uart_msg, "%s \n\r", uart_buffer);
+void print(const char *uart_buffer) {
+    sprintf(uart_msg, "%s\n\r", uart_buffer);
     HAL_UART_Transmit(&hlpuart1, (uint8_t*)uart_msg, strlen(uart_msg), HAL_MAX_DELAY);
 }
 
@@ -80,12 +60,26 @@ void printAddress(uint8_t *address, uint8_t size) {
     for (uint8_t i = 0; i < size; i++) {
         printHex(address[i]);
     }
-    print("\n\r");
+    print(""); // Salto de línea
+}
+
+/* Función auxiliar para convertir un float a cadena sin usar %.2f */
+void floatToString(float value, char *buffer) {
+    /* Separamos la parte entera y la fracción (dos decimales) */
+    if(value < 0) {
+        *buffer++ = '-';
+        value = -value;
+    }
+    int intPart = (int)value;
+    int fracPart = (int)((value - intPart) * 100); // dos decimales
+    sprintf(buffer, "%d.%02d", intPart, fracPart);
 }
 
 void printPayload(float *data, uint8_t size) {
+    char floatStr[20];
     for (uint8_t i = 0; i < size; i++) {
-        sprintf(uart_msg, "Data[%d]: %.2f\n\r", i, data[i]); // @suppress("Float formatting support")
+        floatToString(data[i], floatStr);
+        sprintf(uart_msg, "Data[%d]: %s\n\r", i, floatStr);
         HAL_UART_Transmit(&hlpuart1, (uint8_t*)uart_msg, strlen(uart_msg), HAL_MAX_DELAY);
     }
 }
@@ -95,53 +89,58 @@ void printPayload(float *data, uint8_t size) {
   * @brief  The application entry point.
   * @retval int
   */
-int main(void) {
-    /* MCU Configuration and Initialization */
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init();
-    MX_LPUART1_UART_Init();
-    MX_SPI2_Init();
+int main(void)
+{
+  /* MCU Configuration */
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_LPUART1_UART_Init();
+  MX_SPI2_Init();
 
-    /* NRF24 Initialization */
-    NRF24_Init();
-    NRF24_RxMode(RxAddress, 100);  // Set channel to 100
+  /* NRF24 Inicialización */
+  NRF24_Init();
+  // Configuramos el receptor en canal 100.
+  // (Nota: en NRF24_RxMode se configura el payload para el pipe 2).
+  NRF24_RxMode(RxAddress, 100);
 
-    /* Debugging: Print Receiver Address */
-    print("Receiver Address: ");
-    printAddress(RxAddress, 5);
+  /* Depuración: Imprime la dirección del receptor */
+  print("Receiver Address:");
+  printAddress(RxAddress, 5);
 
-    /* Infinite Loop */
-    while (1) {
-        /* Check if data is available */
-    	print("Receiver Address: ");
-    	printAddress(RxAddress, 5);
-    	uint8_t status = nrf24_ReadReg(STATUS);
-    	char status_msg[50];
-    	print(status);
+  /* Bucle principal */
+  while (1)
+  {
+    // Leer el registro STATUS
+    uint8_t status = nrf24_ReadReg(STATUS);
+    sprintf(uart_msg, "Status: %02X\n\r", status);
+    HAL_UART_Transmit(&hlpuart1, (uint8_t*)uart_msg, strlen(uart_msg), HAL_MAX_DELAY);
 
-    	uint8_t pipe_number = (status >> 1) & 0x07;
-    	char pipe_msg[50];
-    	print(pipe_number);
+    // Extraer el número de pipe de los bits 3:1 del registro STATUS
+    uint8_t pipe_number = (status >> 1) & 0x07;
+    sprintf(uart_msg, "Pipe number: %d\n\r", pipe_number);
+    HAL_UART_Transmit(&hlpuart1, (uint8_t*)uart_msg, strlen(uart_msg), HAL_MAX_DELAY);
 
-        if (isDataAvailable(1)) {  // Check for data on Pipe 1
-            /* Receive the data */
-            NRF24_Receive((uint8_t*)receivedData);
+    // Verificar si hay datos disponibles en el pipe 2 (ya que en NRF24_RxMode se configuró el pipe 2)
+    if (isDataAvailable(2))
+    {
+        // Recibir la carga útil
+        NRF24_Receive((uint8_t*)receivedData);
 
-            /* Print the received payload */
-            print("Received Payload: ");
-            printPayload(receivedData, 8);
+        print("Received Payload:");
+        printPayload(receivedData, 8);
 
-            /* Clear the RX_DR bit in the STATUS register */
-            nrf24_WriteReg(STATUS, (1 << 6));  // Clear RX_DR bit
-        } else {
-            /* Print a message if no data is available */
-            print("No data available\n\r");
-        }
-
-        /* Add a small delay to avoid flooding the UART */
-        HAL_Delay(100);
+        // Se limpia el bit RX_DR del registro STATUS
+        nrf24_WriteReg(STATUS, (1 << 6));
     }
+    else
+    {
+        print("No data available");
+    }
+
+    // Pequeño retardo para evitar saturar la UART
+    HAL_Delay(100);
+  }
 }
 
 /**
@@ -153,13 +152,8 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -175,10 +169,8 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
@@ -192,19 +184,10 @@ void SystemClock_Config(void)
 
 /**
   * @brief LPUART1 Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_LPUART1_UART_Init(void)
 {
-
-  /* USER CODE BEGIN LPUART1_Init 0 */
-
-  /* USER CODE END LPUART1_Init 0 */
-
-  /* USER CODE BEGIN LPUART1_Init 1 */
-
-  /* USER CODE END LPUART1_Init 1 */
   hlpuart1.Instance = LPUART1;
   hlpuart1.Init.BaudRate = 115200;
   hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -231,28 +214,14 @@ static void MX_LPUART1_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN LPUART1_Init 2 */
-
-  /* USER CODE END LPUART1_Init 2 */
-
 }
 
 /**
   * @brief SPI2 Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_SPI2_Init(void)
 {
-
-  /* USER CODE BEGIN SPI2_Init 0 */
-
-  /* USER CODE END SPI2_Init 0 */
-
-  /* USER CODE BEGIN SPI2_Init 1 */
-
-  /* USER CODE END SPI2_Init 1 */
-  /* SPI2 parameter configuration*/
   hspi2.Instance = SPI2;
   hspi2.Init.Mode = SPI_MODE_MASTER;
   hspi2.Init.Direction = SPI_DIRECTION_2LINES;
@@ -271,67 +240,48 @@ static void MX_SPI2_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SPI2_Init 2 */
-
-  /* USER CODE END SPI2_Init 2 */
-
 }
 
 /**
   * @brief GPIO Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
+  /* Habilitar relojes de los puertos */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
+  /* Configurar pines para CSN y CE (NRF24) */
   HAL_GPIO_WritePin(GPIOC, CSN_Pin|CE_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : NRF_IRQ_Pin */
   GPIO_InitStruct.Pin = NRF_IRQ_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(NRF_IRQ_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : CSN_Pin CE_Pin */
   GPIO_InitStruct.Pin = CSN_Pin|CE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD2_Pin */
   GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
-
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
 }
-
-/* USER CODE BEGIN 4 */
-/* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -339,28 +289,15 @@ static void MX_GPIO_Init(void)
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
+  /* Informe de error en caso de fallo en assert */
 }
 #endif /* USE_FULL_ASSERT */
