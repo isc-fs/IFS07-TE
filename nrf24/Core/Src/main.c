@@ -127,48 +127,42 @@ int main(void)
   NRF24_TxMode(TxAddress, 100);
 
   int i = 0;
+
+  print("Inicializando TX");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+  while (1) {
+      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      HAL_Delay(300);
 
-    /* USER CODE END WHILE */
+      float *data[] = {data1, data2, data3, data4, data5, data6, data7, data8};
 
-    /* USER CODE BEGIN 3 */
-	  // Enviar diferentes paquetes de datos
-	  //id = chooseRandomNumber(Id, 8);
-	  //generate_data(id, data_buffer);
-	  float *data[] = {data1, data2, data3, data4, data5, data6, data7, data8};
+      // Mostrar por UART qué se va a enviar
+      sprintf(uart_msg, "\r\n[TX] Enviando paquete con ID: 0x%X", (uint16_t)data[i][0]);
+      HAL_UART_Transmit(&hlpuart1, (uint8_t*)uart_msg, strlen(uart_msg), HAL_MAX_DELAY);
 
-	  if (NRF24_Transmit(data[i]) == 1) {
-	  			  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-	  			  i++;
-	  			  HAL_Delay(300);
-	  			  if(HAL_GPIO_ReadPin(GPIOC,GPIO_PIN_13)){
-	  				  break;
-	  			  }
-	  }
-	  if(i == 8){
-		  i=0;
-	  }
+      for (int j = 1; j < 8; j++) {
+          int ent = (int)data[i][j];
+          int dec = (int)((data[i][j] - ent) * 100);
+          if (dec < 0) dec *= -1;
+          sprintf(uart_msg, ", V%d: %d.%02d", j, ent, dec);
+          HAL_UART_Transmit(&hlpuart1, (uint8_t*)uart_msg, strlen(uart_msg), HAL_MAX_DELAY);
+      }
+      HAL_UART_Transmit(&hlpuart1, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
 
-	  /* Bucle para transmitir los datos
-	  for (int i = 0; i < 8; i++) {
-		  if (NRF24_Transmit(data[i]) == 1) {
-			  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-		  }
-		  HAL_Delay(200);
-	  }*/
-	  /*if(NRF24_Transmit(data1)==1){
-		  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      // Enviar por radio
+      if (NRF24_Transmit(data[i]) == 1) {
+          print("[TX] Transmisión exitosa.");
+      } else {
+          print("[TX] FALLO de transmisión.");
+      }
 
-	  }
-	  HAL_Delay(1000);*/
+      i++;
+      if (i == 8) i = 0;
+    }
   }
-  /* USER CODE END 3 */
-}
 
 /**
   * @brief System Clock Configuration
