@@ -12,23 +12,29 @@ import queue
 import time
 import ISC_RTT_serial as ISC_RTT
 from PIL import Image, ImageTk
-import sys
+import sys, os
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
 from collections import deque
 
-# Configurar display para Raspberry Pi
-os.environ["DISPLAY"] = ":0"
+if sys.platform.startswith("linux") and "DISPLAY" not in os.environ:
+    os.environ["DISPLAY"] = ":0"
 
 class TelemetryUI:
     """Clase principal para la interfaz de telemetría"""
     
     def __init__(self):
-        self.setup_ui()
         self.setup_data_structures()
-        self.setup_threads()
+        self.setup_ui()
+        
+        #self.setup_threads()
+
+    def setup_threads(self):
+        pass  # Placeholder if needed for future thread setup
+
+    
         
     def setup_data_structures(self):
         """Inicializa las estructuras de datos para la telemetría"""
@@ -76,8 +82,8 @@ class TelemetryUI:
         """Crea el header con logo y título"""
         try:
             # Cargar y redimensionar logo
-            logo = Image.open("/home/pi/ISC_REAL_TIME/isc_logo.png")
-            logo = logo.resize((50, 50), Image.ANTIALIAS)
+            logo = Image.open("ISC_REAL_TIME_25/isc_logo.png")
+            logo = logo.resize((50, 50), Image.Resampling.LANCZOS)
             self.tk_logo = ImageTk.PhotoImage(logo)
             
             # Label del header
