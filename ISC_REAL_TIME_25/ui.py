@@ -34,6 +34,16 @@ class TelemetryUI:
     def setup_threads(self):
         pass  # Placeholder if needed for future thread setup
 
+    def minimize_window(self):
+        """Minimiza la ventana de la aplicación"""
+        if self.root.attributes('-fullscreen'):
+            self.root.attributes('-fullscreen', False)
+        self.root.iconify()
+
+    def close_window(self):
+        """Cierra la ventana de la aplicación"""
+        self.exit_program()
+
     
         
     def setup_data_structures(self):
@@ -79,96 +89,114 @@ class TelemetryUI:
         self.setup_bindings()
 
     def create_header(self):
-        """Crea el header con logo y título"""
+        """Header con logo+título centrado y botones de ventana a la derecha"""
+            # --- fila 0: una barra horizontal con 3 zonas (izq, centro, dcha) ---
+        # 6 columnas ya configuradas en setup_ui()
+        # Zona centro: título con (opcional) logo
+        center_frame = tk.Frame(self.root, bg="#101010")
+        center_frame.grid(row=0, column=0, columnspan=6, sticky="n", pady=10)
+
         try:
-            # Cargar y redimensionar logo
+            from PIL import Image, ImageTk
             logo = Image.open("ISC_REAL_TIME_25/isc_logo.png")
             logo = logo.resize((50, 50), Image.Resampling.LANCZOS)
             self.tk_logo = ImageTk.PhotoImage(logo)
-            
-            # Label del header
-            self.header_label = tk.Label(
-                self.root, 
-                text="ISC Real-Time Telemetry", 
+            title = tk.Label(
+                center_frame,
+                text="ISC Real-Time Telemetry",
                 font=("Inter", 22, "bold"),
-                fg="#FFFFFF", 
-                bg="#101010", 
-                image=self.tk_logo, 
-                compound="left", 
-                padx=10
+                fg="#FFFFFF",
+                bg="#101010",
+                image=self.tk_logo,
+                compound="left",
+                padx=10,
             )
-            self.header_label.grid(row=0, column=1, columnspan=3, pady=10)
-            
-        except Exception as e:
-            # Si no se puede cargar el logo, mostrar solo texto
-            self.header_label = tk.Label(
-                self.root, 
-                text="ISC Real-Time Telemetry", 
+        except Exception:
+            title = tk.Label(
+                center_frame,
+                text="ISC Real-Time Telemetry",
                 font=("Inter", 22, "bold"),
-                fg="#FFFFFF", 
-                bg="#101010"
+                fg="#FFFFFF",
+                bg="#101010",
             )
-            self.header_label.grid(row=0, column=1, columnspan=3, pady=10)
+        title.pack()
+
+        # Zona derecha: botones minimizar y cerrar
+        right_frame = tk.Frame(self.root, bg="#101010")
+        right_frame.grid(row=0, column=5, sticky="ne", padx=10, pady=10)
+
+        btn_min = tk.Button(
+            right_frame, text="—",  # guion largo
+            font=("Inter", 14, "bold"),
+            fg="#FFFFFF", bg="#303030", activebackground="#505050",
+            width=3, borderwidth=0, command=self.minimize_window
+        )
+        btn_min.pack(side="left", padx=(0, 6))
+
+        btn_close = tk.Button(
+            right_frame, text="×",
+            font=("Inter", 14, "bold"),
+            fg="#FFFFFF", bg="#C43131", activebackground="#E04B4B",
+            width=3, borderwidth=0, command=self.close_window
+        )
+        btn_close.pack(side="left")
+
+        
 
     def create_controls(self):
-        """Crea los controles (dropdowns y botones)"""
-        # Variables para dropdowns
-        self.piloto_var = tk.StringVar(self.root)
-        self.piloto_var.set(self.pilots_list[0])
-        
-        self.circuito_var = tk.StringVar(self.root)
-        self.circuito_var.set(self.circuits_list[0])
-        
-        # Dropdown de piloto
-        pilot_label = tk.Label(
-            self.root, text="Piloto", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
-        pilot_label.grid(row=1, column=0, padx=5, pady=5)
-        
-        self.pilot_menu = tk.OptionMenu(self.root, self.piloto_var, *self.pilots_list)
-        self.pilot_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020")
-        self.pilot_menu.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
-        
-        # Dropdown de circuito
-        circuit_label = tk.Label(
-            self.root, text="Circuito", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
-        circuit_label.grid(row=1, column=1, padx=5, pady=5)
-        
-        self.circuit_menu = tk.OptionMenu(self.root, self.circuito_var, *self.circuits_list)
-        self.circuit_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020")
-        self.circuit_menu.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
-        
-        # Botones de control
+        """Selectores centrados bajo el título y botones debajo"""
+        # Marco principal centrado para selects
+        selects_frame = tk.Frame(self.root, bg="#101010")
+        selects_frame.grid(row=1, column=0, columnspan=6, sticky="n", pady=(5, 0))
+
+        # Submarco con grid de 2 columnas (Piloto | Circuito)
+        form = tk.Frame(selects_frame, bg="#101010")
+        form.pack()
+
+        # Variables
+        self.piloto_var = tk.StringVar(self.root, value=self.pilots_list[0])
+        self.circuito_var = tk.StringVar(self.root, value=self.circuits_list[0])
+
+        # Piloto
+        pilot_label = tk.Label(form, text="Piloto", font=("Inter", 14),
+                            fg="#FFFFFF", bg="#101010")
+        pilot_label.grid(row=0, column=0, padx=10, pady=(5, 2), sticky="s")
+        self.pilot_menu = tk.OptionMenu(form, self.piloto_var, *self.pilots_list)
+        self.pilot_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020",
+                            highlightthickness=0, bd=0)
+        self.pilot_menu.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
+
+        # Circuito
+        circuit_label = tk.Label(form, text="Circuito", font=("Inter", 14),
+                                fg="#FFFFFF", bg="#101010")
+        circuit_label.grid(row=0, column=1, padx=10, pady=(5, 2), sticky="s")
+        self.circuit_menu = tk.OptionMenu(form, self.circuito_var, *self.circuits_list)
+        self.circuit_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020",
+                                highlightthickness=0, bd=0)
+        self.circuit_menu.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="ew")
+
+        # Marco para botones debajo de los selects
+        buttons_frame = tk.Frame(self.root, bg="#101010")
+        buttons_frame.grid(row=2, column=0, columnspan=6, sticky="n", pady=(0, 10))
+
         self.run_button = tk.Button(
-            self.root, text="INICIAR", 
-            font=("Inter", 14, "bold"),
-            fg="#FFFFFF", bg="#006400", 
-            command=self.start_receiving,
-            relief="raised", bd=2
-        )
-        self.run_button.grid(row=2, column=2, padx=5, pady=5, sticky="ew")
-        
+            buttons_frame, text="INICIAR",
+            font=("Inter", 14, "bold"), fg="#FFFFFF", bg="#006400",
+            command=self.start_receiving, relief="raised", bd=2, width=12)
+        self.run_button.pack(side="left", padx=8)
+
         self.stop_button = tk.Button(
-            self.root, text="PARAR", 
-            font=("Inter", 14, "bold"),
-            fg="#FFFFFF", bg="#CC0000", 
-            command=self.stop_receiving,
-            relief="raised", bd=2
-        )
-        self.stop_button.grid(row=2, column=3, padx=5, pady=5, sticky="ew")
-        
-        # Botón de salida
-        self.exit_button = tk.Button(
-            self.root, text="SALIR", 
-            font=("Inter", 14, "bold"),
-            fg="#FFFFFF", bg="#FF0000", 
-            command=self.exit_program,
-            relief="raised", bd=2
-        )
-        self.exit_button.grid(row=2, column=4, padx=5, pady=5, sticky="ew")
+            buttons_frame, text="PARAR",
+            font=("Inter", 14, "bold"), fg="#FFFFFF", bg="#CC0000",
+            command=self.stop_receiving, relief="raised", bd=2, width=12, state="disabled")
+        self.stop_button.pack(side="left", padx=8)
+    
+    def setup_bindings(self):
+        self.root.bind("<Escape>", self.close_fullscreen)
+        self.root.bind("<F11>", self.toggle_fullscreen)
+        self.root.bind("<Control-m>", lambda e: self.minimize_window())
+
+
 
     def create_data_displays(self):
         """Crea los cuadros de visualización de datos"""
