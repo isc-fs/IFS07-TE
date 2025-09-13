@@ -124,7 +124,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   NRF24_Init();
-  NRF24_TxMode(TxAddress, 100);
+  NRF24_TxMode(TxAddress, 76);
+  NRF24_Dump();
 
   int i = 0;
 
@@ -153,11 +154,20 @@ int main(void)
       HAL_UART_Transmit(&hlpuart1, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
 
       // Enviar por radio
-      if (NRF24_Transmit(data[i]) == 1) {
+      uint8_t ok = NRF24_Transmit((uint8_t*)data[i]);
+      uint8_t st = nrf24_ReadReg(STATUS);
+      uint8_t ob = nrf24_ReadReg(OBSERVE_TX);   // [PLOS_CNT | ARC_CNT]
+
+      if (ok) {
           print("[TX] Transmisión exitosa.");
       } else {
           print("[TX] FALLO de transmisión.");
       }
+
+      /* Extra diagnostics */
+      sprintf(uart_msg, "STATUS=%02X OBSERVE_TX=%02X\r\n", st, ob);
+      HAL_UART_Transmit(&hlpuart1,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
+
 
       i++;
       if (i == 8) i = 0;
@@ -314,8 +324,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, CSN_Pin|CE_Pin, GPIO_PIN_RESET);
+  /* Idle levels at reset: CSN=HIGH (not selected), CE=LOW */
+  HAL_GPIO_WritePin(GPIOC, CSN_Pin, GPIO_PIN_SET);    // CSN HIGH
+  HAL_GPIO_WritePin(GPIOC, CE_Pin,  GPIO_PIN_RESET);  // CE  LOW
+
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);

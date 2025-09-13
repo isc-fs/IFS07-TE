@@ -21,6 +21,9 @@
 
 #include "stm32g4xx_hal.h" //Cambiar al H7 en main
 #include "nrf24.h"
+#include <string.h>
+#include <stdio.h>
+extern UART_HandleTypeDef hlpuart1;
 
 extern SPI_HandleTypeDef hspi2;
 #define NRF24_SPI &hspi2
@@ -182,102 +185,99 @@ void nrf24_reset(uint8_t REG)
 
 void NRF24_Init (void)
 {
-	// disable the chip before configuring the device
-	CE_Disable();
+  CE_Disable();
 
+  nrf24_reset(0);
 
-	// reset everything
-	nrf24_reset (0);
+  // --- Hard match RX settings for the first bring-up ---
+  nrf24_WriteReg(EN_AA,     0x00);   // NO Auto-ACK on any pipe
+  nrf24_WriteReg(SETUP_RETR,0x00);   // NO retries
+  nrf24_WriteReg(EN_RXADDR, 0x03);   // P0 & P1 enabled (ok)
+  nrf24_WriteReg(SETUP_AW,  0x03);   // 5-byte addresses
+  nrf24_WriteReg(RF_CH,     76);     // Channel 76 (0x4C)
+  nrf24_WriteReg(RF_SETUP,  0x06);   // 1 Mbps, 0 dBm, LNA on
 
-	nrf24_WriteReg(CONFIG, 0);  // will be configured later
+  nrf24_WriteReg(FEATURE,   0x00);   // dynamic payloads OFF
+  nrf24_WriteReg(DYNPD,     0x00);   // fixed payload widths
+  nrf24_WriteReg(FIFO_STATUS,0x11);  // reset FIFOs
+  nrf24_WriteReg(STATUS,    0x70);   // clear IRQs
 
-	nrf24_WriteReg(EN_AA, 0x3F);  // No Auto ACK 0011 1111
-
-	nrf24_WriteReg (EN_RXADDR, 0x03);  // P0:on P1:on P2:off P3:off P4:off P5:off
-
-	nrf24_WriteReg (SETUP_AW, 0x03);  // 5 Bytes for the TX/RX address
-
-	nrf24_WriteReg (SETUP_RETR, 0x1F);   // retry delay 500 us, retries 15
-
-	nrf24_WriteReg (RF_CH, 0);  // will be setup during Tx or RX
-
-	nrf24_WriteReg (RF_SETUP, 0x09);   // no continuous carrier, no force PLL lock, 2 Mbps, -18 dBm Él último es un don t care pero quien sabe...
-
-	nrf24_WriteReg (FIFO_STATUS, 0x11);
-
-	nrf24_WriteReg (STATUS, 0x70); // no RX data, no TX, TX retries ok, no pipe data, TX FIFO not full
-
-	nrf24_WriteReg(DYNPD, 0x03); //P0:off P1:on P2:off P3:off P4:off P5:off estaba solo dos
-
-	nrf24_WriteReg(FEATURE, 0x04);
-
-
-	// Enable the chip after configuring the device
-	CE_Enable();
-
+  // Leave CONFIG to TxMode (power up there)
+  CE_Enable();
 }
+
 
 
 // set up the Tx mode
 
 void NRF24_TxMode (uint8_t *Address, uint8_t channel)
 {
-	// disable the chip before configuring the device
-	CE_Disable();
+  CE_Disable();
 
-	nrf24_WriteReg (RF_CH, 0x64);  // select the channel
+  nrf24_WriteReg (RF_CH, channel);        // use the argument (76 now)
 
-	nrf24_WriteRegMulti(TX_ADDR, Address, 5);  // Write the TX address
+  nrf24_WriteRegMulti(TX_ADDR, Address, 5);
+  nrf24_WriteRegMulti(RX_ADDR_P0, Address, 5); // P0 will be the ACK return addr once we enable ACKs
 
+  // Power up TX, PRIM_RX=0, EN_CRC=1, CRCO=1 (16-bit CRC)
+  uint8_t cfg = (1<<1) | (1<<3) | (1<<2); // 0x0E
+  nrf24_WriteReg(CONFIG, cfg);
 
-	// power up the device
-	uint8_t config = nrf24_ReadReg(CONFIG);
-//	config = config | (1<<1);   // write 1 in the PWR_UP bit
-	config = 0x7E;// config & (0xF2);    // write 0 in the PRIM_RX, and 1 in the PWR_UP,CRC 2 bytes and all other bits are masked
-	nrf24_WriteReg (CONFIG, config);
-
-	// Enable the chip after configuring the device
-	CE_Enable();
+  CE_Enable();
 }
+
 
 
 // transmit the data
 
 uint8_t NRF24_Transmit (uint8_t *data)
 {
-	uint8_t cmdtosend = 0;
+    uint8_t cmd, status;
+    uint32_t t0;
 
-	// select the device
-	CS_Select();
+    // 1) CE LOW before loading the payload
+    CE_Disable();
 
-	// payload command
-	cmdtosend = W_TX_PAYLOAD;
-	HAL_SPI_Transmit(NRF24_SPI, &cmdtosend, 1, 100);
+    // 2) Load TX FIFO
+    CS_Select();
+    cmd = W_TX_PAYLOAD;
+    HAL_SPI_Transmit(NRF24_SPI, &cmd, 1, 100);
+    HAL_SPI_Transmit(NRF24_SPI, data, 32, 1000);
+    CS_UnSelect();
 
-	// send the payload
-	HAL_SPI_Transmit(NRF24_SPI, data, 32, 1000);
+    // 3) Pulse CE HIGH >= ~10 us to start ShockBurst
+    CE_Enable();
+    for (volatile int i = 0; i < 300; i++) { __NOP(); }  // NOTE: __NOP() not __NOP__
+    CE_Disable();
 
-	// Unselect the device
-	CS_UnSelect();
+    // 4) Poll STATUS for TX_DS or MAX_RT (timeout ~5 ms)
+    t0 = HAL_GetTick();
+    do {
+        status = nrf24_ReadReg(STATUS);
+        if (status & (1<<5)) break; // TX_DS
+        if (status & (1<<4)) break; // MAX_RT
+    } while ((HAL_GetTick() - t0) < 5);
 
-	HAL_Delay(1);
+    // 5) Clear IRQ flags
+    nrf24_WriteReg(STATUS, (1<<5) | (1<<4) | (1<<6));
 
-	uint8_t fifostatus = nrf24_ReadReg(FIFO_STATUS);
+    // 6) On MAX_RT, flush and print quick diag, then fail
+    if (status & (1<<4)) {
+        cmd = FLUSH_TX;
+        nrfsendCmd(cmd);
 
-	// check the fourth bit of FIFO_STATUS to know if the TX fifo is empty
-	if ((fifostatus&(1<<4)) && (!(fifostatus&(1<<3))))
-	{
-		cmdtosend = FLUSH_TX;
-		nrfsendCmd(cmdtosend);
+        uint8_t ob = nrf24_ReadReg(OBSERVE_TX); // [PLOS_CNT | ARC_CNT]
+        char msg[64];
+        snprintf(msg, sizeof(msg),
+                 "[TX] MAX_RT. STATUS=%02X OBSERVE_TX=%02X\r\n", status, ob);
+        HAL_UART_Transmit(&hlpuart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        return 0;
+    }
 
-		// reset FIFO_STATUS
-		nrf24_reset (FIFO_STATUS);
-
-		return 1;
-	}
-
-	return 0;
+    return (status & (1<<5)) ? 1 : 0;
 }
+
+
 
 
 void NRF24_RxMode (uint8_t *Address, uint8_t channel)
@@ -386,6 +386,44 @@ void NRF24_ReadAll (uint8_t *data)
 	}
 
 }
+
+// --- put near other prototypes ---
+static void dump_hex5(const char *name, uint8_t *v);
+
+// --- add at the bottom of nrf24.c ---
+extern UART_HandleTypeDef hlpuart1;        // for prints
+static char dbg[64];
+static void put(const char *s){ HAL_UART_Transmit(&hlpuart1,(uint8_t*)s,strlen(s),HAL_MAX_DELAY); }
+
+static void hex1(const char *name, uint8_t v){
+  snprintf(dbg, sizeof(dbg), "%s=%02X ", name, v);
+  put(dbg);
+}
+static void dump_hex5(const char *name, uint8_t *v){
+  snprintf(dbg, sizeof(dbg), "%s=%02X %02X %02X %02X %02X  ",
+           name, v[0], v[1], v[2], v[3], v[4]);
+  put(dbg);
+}
+
+void NRF24_Dump(void)
+{
+  uint8_t v, addr[5];
+
+  v = nrf24_ReadReg(CONFIG);      hex1("CFG", v);
+  v = nrf24_ReadReg(EN_AA);       hex1("EN_AA", v);
+  v = nrf24_ReadReg(SETUP_RETR);  hex1("RETR", v);
+  v = nrf24_ReadReg(RF_CH);       hex1("CH", v);
+  v = nrf24_ReadReg(RF_SETUP);    hex1("RF", v);
+  v = nrf24_ReadReg(FEATURE);     hex1("FEAT", v);
+  v = nrf24_ReadReg(DYNPD);       hex1("DYNPD", v);
+
+  nrf24_ReadReg_Multi(TX_ADDR, addr, 5);      dump_hex5("TX", addr);
+  nrf24_ReadReg_Multi(RX_ADDR_P0, addr, 5);   dump_hex5("RX0", addr);
+
+  v = nrf24_ReadReg(STATUS);      hex1("STAT", v);
+  put("\r\n");
+}
+
 
 
 

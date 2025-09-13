@@ -1,64 +1,85 @@
-/* RF-NANO receiver -> USB Serial forwarder (32B frames)
- * Requisitos: RF24 by TMRh20 (Arduino Library Manager)
- * Dirección RF: 0xE7E7E7E7E7, Canal: 100, DataRate: 2Mbps, Payload: 32
- * Serie: 115200 8N1
- */
-
 #include <SPI.h>
 #include <RF24.h>
+#include "printf.h"
 
-// Pines del RF-NANO (según placa: CE=D10, CSN=D9 en este modelo)
 static const uint8_t PIN_CE  = 10;
 static const uint8_t PIN_CSN = 9;
-
 RF24 radio(PIN_CE, PIN_CSN);
 
-// Dirección y configuración RF
-static const uint64_t PIPE_ADDR = 0xE7E7E7E7E7LL; // 5 bytes efectivos
-static const uint8_t  CHANNEL   = 100;           // 0x64
-static const uint8_t  PAYLOAD   = 32;            // 8 floats
-
-// Encapsulado serie
-static const uint8_t SOF1 = 0xAA;
-static const uint8_t SOF2 = 0x55;
+static const uint64_t PIPE_ADDR = 0xE7E7E7E7E7ULL;
+static const uint8_t  CHANNEL   = 76;   // 0x4C
+static const uint8_t  PAYLOAD   = 32;   // 8 floats
 
 uint8_t buf[PAYLOAD];
+unsigned long lastCheck = 0;
+
+static void dumpHex(const uint8_t* p, uint8_t n) {
+  for (uint8_t i = 0; i < n; ++i) {
+    if (i) Serial.print(' ');
+    if (p[i] < 16) Serial.print('0');
+    Serial.print(p[i], HEX);
+  }
+}
 
 void setup() {
-  // USB-Serial
   Serial.begin(115200);
-  while (!Serial) { /* esperar si es necesario */ }
+  while (!Serial) {}
 
-  // RF24
+  printf_begin();
+  Serial.println(F("Init RF-NANO RX..."));
+
   if (!radio.begin()) {
-    Serial.println(F("ERR: radio.begin()"));
+    Serial.println(F("ERR: radio.begin() returned false (chip not detected)."));
   }
 
+  radio.setAddressWidth(5);
   radio.setChannel(CHANNEL);
-  radio.setAutoAck(false);           // El TX STM no envía NO_ACK explícito; desactiva ACK por robustez
-  radio.setDataRate(RF24_2MBPS);     // 2 Mbps
-  radio.setCRCLength(RF24_CRC_16);   // CRC en RF (opcional)
-  radio.setPALevel(RF24_PA_MIN);     // Ajustable (ver sección potencia en datasheet). :contentReference[oaicite:3]{index=3}
-  radio.disableDynamicPayloads();    // Forzamos tamaño fijo
+  radio.setAutoAck(false);          // NO-ACK
+  radio.setDataRate(RF24_1MBPS);    // 1 Mbps to match STM
+  radio.setCRCLength(RF24_CRC_16);
+  radio.setPALevel(RF24_PA_MAX);
+
+  radio.disableDynamicPayloads();
   radio.setPayloadSize(PAYLOAD);
   radio.openReadingPipe(1, PIPE_ADDR);
   radio.startListening();
 
-  Serial.println(F("RF-NANO RX listo (CH=100, 2Mbps, 32B)."));
+  radio.printDetails();
+  Serial.print(F("Chip conectado: "));
+  Serial.println(radio.isChipConnected() ? F("SI") : F("NO"));
+  Serial.println(F("RF-NANO RX listo."));
 }
 
 void loop() {
-  while (radio.available()) {
-    radio.read(buf, PAYLOAD);
-    // Calcular checksum XOR
-    uint8_t chk = 0;
-    for (uint8_t i = 0; i < PAYLOAD; ++i) chk ^= buf[i];
+  unsigned long now = millis();
+  if (now - lastCheck >= 500) {
+    lastCheck = now;
+    Serial.println(F("Radio Checking"));
+  }
 
-    // Enviar frame a PC
-    Serial.write(SOF1);
-    Serial.write(SOF2);
-    Serial.write(PAYLOAD);
-    Serial.write(buf, PAYLOAD);
-    Serial.write(chk);
+  if (radio.available()) {
+    while (radio.available()) {
+      radio.read(buf, PAYLOAD);
+
+      // ---------- (A) HEX DUMP ----------
+      Serial.print(F("[RX] HEX: "));
+      dumpHex(buf, PAYLOAD);
+      Serial.println();
+
+      // ---------- (B) DECODE AS 8 FLOATS ----------
+      float f[8];
+      memcpy(f, buf, 32); // AVR and STM32 are little-endian IEEE754
+      Serial.print(F("[RX] FLOATS: "));
+      for (int i = 0; i < 8; ++i) {
+        Serial.print(f[i], 2);
+        if (i != 7) Serial.print(F(", "));
+      }
+      Serial.println();
+
+      // ---------- (C) OPTIONAL: treat first float as ID ----------
+      uint32_t id = (uint32_t)f[0];
+      Serial.print(F("[RX] ID=0x"));
+      Serial.println(id, HEX);
+    }
   }
 }
