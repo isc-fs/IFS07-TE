@@ -56,6 +56,8 @@ FDCAN_HandleTypeDef hfdcan3;
 
 SD_HandleTypeDef hsd1;
 
+SPI_HandleTypeDef hspi2;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim16;
 
@@ -81,11 +83,23 @@ static void MX_TIM16_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_FDCAN3_Init(void);
+static void MX_SPI2_Init(void);
 /* USER CODE BEGIN PFP */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// ---------- TEL Testing ----------
+#include "nrf24.h"
+#define TEL_USE_DUMMY   1   // set 1 to test without CAN, 0 for real can data
+#define TEL_CHAN        76
+static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
+
+static uint32_t tel_tick = 0;  // ms accumulator to 500
+// forward decls
+static void tel_build_packet(float f[8]);
+static void tel_send_now(void);
 
 // ---------- MODOS DEBUG ----------
 #define DEBUG 1
@@ -243,10 +257,15 @@ int main(void)
   MX_SDMMC1_SD_Init();
   MX_FATFS_Init();
   MX_FDCAN3_Init();
+  MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
 	// Inicializar tarjeta microSD
 	//SDCard_start();
 	//HAL_Delay(2000);
+  // ---- nRF24 bring-up ----
+  NRF24_Init();
+  NRF24_TxMode(rf_addr, TEL_CHAN);
+  NRF24_Dump();                           // prints via UART for sanity
 
 	// EJEMPLO SDCARD
 
@@ -1033,6 +1052,54 @@ static void MX_SDMMC1_SD_Init(void)
 }
 
 /**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 0x0;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi2.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi2.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi2.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi2.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi2.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi2.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi2.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi2.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi2.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -1728,6 +1795,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		TxData_Acu[0] = inv_dc_bus_voltage & 0xFF;
 		TxData_Acu[1] = (inv_dc_bus_voltage >> 8) & 0xFF;
 		//printValue(inv_dc_bus_voltage);
+		tel_tick += 10;
+		        if (tel_tick >= 500) {
+		            tel_tick = 0;
+		            tel_send_now();   // 32B nRF24 burst
+		        }
 		if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu) == HAL_OK)
 		{
 #if DEBUG
@@ -1974,6 +2046,64 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 #endif
 	}
 }
+
+// Packs 8 floats (32 bytes). f[0] is the "frame ID".
+static void tel_build_packet(float f[8]) {
+    memset(f, 0, 8*sizeof(float));
+
+#if TEL_USE_DUMMY
+    static uint16_t ids[] = {0x610,0x600,0x630,0x640,0x650,0x670,0x660,0x680};
+    static uint8_t idx = 0; if (++idx >= sizeof(ids)/sizeof(ids[0])) idx = 0;
+
+    f[0] = (float)ids[idx];
+    f[1] = (float)inv_dc_bus_voltage;
+    f[2] = (float)e_machine_rpm;
+    f[3] = (float)torque_total;
+    f[4] = (float)v_celda_min;
+    f[5] = (float)s1_aceleracion;
+    f[6] = (float)s2_aceleracion;
+    f[7] = (float)state;
+#else
+    // Example: one “ACCUM/DCBUS” style frame
+    f[0] = (float)0x600;
+    f[1] = (float)inv_dc_bus_voltage;
+    f[2] = (float)inv_dc_bus_power;   // if you populate it
+    f[3] = (float)e_machine_rpm;
+    f[4] = (float)torque_total;
+    f[5] = (float)v_celda_min;
+    f[6] = (float)s1_aceleracion;
+    f[7] = (float)s2_aceleracion;
+#endif
+}
+
+static void tel_send_now(void) {
+    float pkt[8];
+    tel_build_packet(pkt);
+
+    // debug: print exactly what we'll TX
+    char msg[160];
+    int ent, dec;
+    snprintf(msg, sizeof(msg), "\r\n[TX] ID: 0x%X", (uint16_t)pkt[0]);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    for (int j=1; j<8; ++j) {
+        ent = (int)pkt[j];
+        dec = (int)((pkt[j] - ent) * 100); if (dec < 0) dec = -dec;
+        snprintf(msg, sizeof(msg), ", V%d:%d.%02d", j, ent, dec);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+
+    // TX over nRF24 (32 bytes)
+    uint8_t ok = NRF24_Transmit((uint8_t*)pkt);
+    uint8_t st = nrf24_ReadReg(STATUS);
+    uint8_t ob = nrf24_ReadReg(OBSERVE_TX);
+
+    snprintf(msg, sizeof(msg), ok ? "[TX] OK " : "[TX] FAIL ");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    snprintf(msg, sizeof(msg), "STATUS=%02X OBSERVE_TX=%02X\r\n", st, ob);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
 /*
 void SDCard_start(void)
 {
