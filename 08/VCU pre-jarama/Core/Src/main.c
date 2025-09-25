@@ -28,6 +28,7 @@
 #include "time.h"
 #include "VCU.h"
 #include "LPF.h"
+#include "nrf24.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -91,7 +92,6 @@ static void MX_SPI2_Init(void);
 /* USER CODE BEGIN 0 */
 
 // ---------- TEL Testing ----------
-#include "nrf24.h"
 #define TEL_USE_DUMMY   1   // set 1 to test without CAN, 0 for real can data
 #define TEL_CHAN        76
 static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
@@ -100,6 +100,12 @@ static uint32_t tel_tick = 0;  // ms accumulator to 500
 // forward decls
 static void tel_build_packet(float f[8]);
 static void tel_send_now(void);
+
+/* ---- Telemetry debug counters ---- */
+volatile uint32_t tel_irq_cnt   = 0;   // increments each TIM16 ISR
+volatile uint32_t tel_sent_ok   = 0;   // nRF24 TX successes
+volatile uint32_t tel_sent_fail = 0;   // nRF24 TX failures
+
 
 // ---------- MODOS DEBUG ----------
 #define DEBUG 1
@@ -262,10 +268,36 @@ int main(void)
 	// Inicializar tarjeta microSD
 	//SDCard_start();
 	//HAL_Delay(2000);
+  HAL_Delay(5);
+  uint8_t before = nrf24_ReadReg(CONFIG);
+  uint8_t test   = (uint8_t)~before;
+  nrf24_WriteReg(CONFIG, test);
+  HAL_Delay(1);
+  uint8_t echo   = nrf24_ReadReg(CONFIG);
+  char msg[80];
+  snprintf(msg,sizeof msg,"[NRF-PROBE] before=%02X wrote=%02X echo=%02X\r\n",before,test,echo);
+  HAL_UART_Transmit(&huart2,(uint8_t*)msg,strlen(msg),HAL_MAX_DELAY);
+  // restore
+  nrf24_WriteReg(CONFIG, 0x08);
+
   // ---- nRF24 bring-up ----
   NRF24_Init();
+  //Comentar para uso real
+  HAL_Delay(5);                      // small settle
+  uint8_t st = NRF24_StatusNOP();
+  char m[64];
+  snprintf(m,sizeof(m),"[NRF] STATUS via NOP = 0x%02X\r\n", st);
+  HAL_UART_Transmit(&huart2,(uint8_t*)m,strlen(m),HAL_MAX_DELAY);
+
   NRF24_TxMode(rf_addr, TEL_CHAN);
   NRF24_Dump();                           // prints via UART for sanity
+  uint8_t cfg = nrf24_ReadReg(CONFIG);
+  uint8_t rf  = nrf24_ReadReg(RF_SETUP);
+  uint8_t ch  = nrf24_ReadReg(RF_CH);
+  char info[64];
+  snprintf(info, sizeof(info), "[NRF] CFG=%02X RF=%02X CH=%u\r\n", cfg, rf, ch);
+  HAL_UART_Transmit(&huart2, (uint8_t*)info, strlen(info), HAL_MAX_DELAY);
+
 
 	// EJEMPLO SDCARD
 
@@ -374,9 +406,13 @@ int main(void)
 #endif
 
 	// Espera ACK inversor (DC bus)
+	uint32_t _last_req_log = 0;
 	while (config_inv_lectura_v == 0)
 	{
-		print("Solicitar tensión inversor");
+		if ((HAL_GetTick() - _last_req_log) >= 1000) {
+		        _last_req_log = HAL_GetTick();
+		        print("Solicitar tensión inversor");
+		    }
 		if (config_inv_lectura_v == 1)
 		{
 
@@ -595,6 +631,22 @@ int main(void)
 	{
 
 		// Envío datos telemetría
+		static uint32_t last_1s = 0;
+		static uint32_t last_irq_seen = 0;
+		if (HAL_GetTick() - last_1s >= 1000) {
+		    last_1s = HAL_GetTick();
+		    char hb[96];
+		    snprintf(hb, sizeof(hb),
+		             "[TEL] irq=%lu sent=%lu fail=%lu%s  Vdc=%d  rpm=%d  state=%u\r\n",
+		             (unsigned long)tel_irq_cnt,
+		             (unsigned long)tel_sent_ok,
+		             (unsigned long)tel_sent_fail,
+		             (tel_irq_cnt == last_irq_seen) ? " (NO NEW IRQ!)" : "",
+		             inv_dc_bus_voltage, e_machine_rpm, state);
+		    HAL_UART_Transmit(&huart2, (uint8_t*)hb, strlen(hb), HAL_MAX_DELAY);
+		    last_irq_seen = tel_irq_cnt;
+		}
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -1387,6 +1439,24 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(START_BUTTON1_GPIO_Port, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* --- nRF24 CE/CSN pins (PG3=CSN idle HIGH, PC6=CE idle LOW) --- */
+
+  // Idle levels
+  HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET);   // CSN idle HIGH
+  HAL_GPIO_WritePin(NRF24_CE_PORT,  NRF24_CE_PIN,  GPIO_PIN_RESET); // CE  idle LOW
+
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+
+  GPIO_InitStruct.Pin = NRF24_CSN_PIN;
+  HAL_GPIO_Init(NRF24_CSN_PORT, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = NRF24_CE_PIN;
+  HAL_GPIO_Init(NRF24_CE_PORT, &GPIO_InitStruct);
+
+
+
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -1781,6 +1851,7 @@ printValue(torque_limitado);
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
+
 	if (htim == &htim16)
 	{
 		// Reenvío DC_BUS_VOLTAGE al AMS por CAN_ACU
@@ -1795,11 +1866,30 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		TxData_Acu[0] = inv_dc_bus_voltage & 0xFF;
 		TxData_Acu[1] = (inv_dc_bus_voltage >> 8) & 0xFF;
 		//printValue(inv_dc_bus_voltage);
-		tel_tick += 10;
-		        if (tel_tick >= 500) {
-		            tel_tick = 0;
-		            tel_send_now();   // 32B nRF24 burst
-		        }
+		/* --- Telemetry tick: 10ms base --- */
+		    tel_irq_cnt++;                // <--- ADD
+		    tel_tick += 10;
+		    if (tel_tick >= 500) {        // 500 ms cadence
+		        tel_tick = 0;
+		        tel_send_now();           // 32B nRF24 burst (no prints from ISR)
+		    }
+
+		    (void)HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu);
+
+		    precharge_button = HAL_GPIO_ReadPin(START_BUTTON_GPIO_Port, START_BUTTON_Pin);
+
+		    TxHeader_Acu.Identifier = 0x600;
+		    TxHeader_Acu.DataLength = 2;
+		    TxHeader_Acu.IdType     = FDCAN_EXTENDED_ID;
+		    TxHeader_Acu.FDFormat   = FDCAN_CLASSIC_CAN;
+		    TxHeader_Acu.TxFrameType= FDCAN_DATA_FRAME;
+		    TxData_Acu[0] = precharge_button;
+
+		    /* REMOVE noisy ISR print:
+		       printValue(TxData_Acu[0]);  // <-- delete this (no UART in ISR) */
+
+		    (void)HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu);
+
 		if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu) == HAL_OK)
 		{
 #if DEBUG
@@ -2103,6 +2193,9 @@ static void tel_send_now(void) {
     snprintf(msg, sizeof(msg), "STATUS=%02X OBSERVE_TX=%02X\r\n", st, ob);
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 }
+
+
+
 
 /*
 void SDCard_start(void)

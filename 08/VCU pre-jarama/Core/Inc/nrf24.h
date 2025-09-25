@@ -24,6 +24,14 @@
 #include "stm32h7xx_hal.h"
 #include <stdint.h>
 
+
+// --- NRF24 pins (match board) ---
+#define NRF24_CE_PORT    GPIOC
+#define NRF24_CE_PIN     GPIO_PIN_6
+
+#define NRF24_CSN_PORT   GPIOG
+#define NRF24_CSN_PIN    GPIO_PIN_3
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,7 +46,16 @@ uint8_t NRF24_IsDataAvailable(int pipe);      /* 1 if data pending */
 void    NRF24_Receive(uint8_t *payload32);    /* reads 32 bytes */
 
 void    NRF24_ReadAll(uint8_t *out);          /* debug snapshot */
-void    NRF24_Dump(void);                     /* prints a short dump */
+/* Public low-level accessors (needed by main.c and debug) */
+uint8_t nrf24_ReadReg(uint8_t Reg);
+void    nrf24_ReadReg_Multi(uint8_t Reg, uint8_t *data, int size);
+void    nrf24_WriteReg(uint8_t Reg, uint8_t Data);
+void    nrf24_WriteRegMulti(uint8_t Reg, const uint8_t *data, int size);
+void    nrfsendCmd(uint8_t cmd);
+void    NRF24_Dump(void);
+uint8_t NRF24_StatusNOP(void);   // read STATUS via NOP (SPI sanity check)
+
+/* prints a short dump */
 
 /* ===== Register Map ===== */
 #define CONFIG       0x00

@@ -16,9 +16,9 @@ extern UART_HandleTypeDef huart2;     /* ECU prints go through USART2 */
 
 /* CE / CSN lines */
 #define NRF24_CE_PORT    GPIOC
-#define NRF24_CE_PIN     GPIO_PIN_3
-#define NRF24_CSN_PORT   GPIOC
-#define NRF24_CSN_PIN    GPIO_PIN_2
+#define NRF24_CE_PIN     GPIO_PIN_6
+#define NRF24_CSN_PORT   GPIOG
+#define NRF24_CSN_PIN    GPIO_PIN_3
 
 /* ==== Local helpers ====================================================== */
 static inline void CS_Select(void)   { HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_RESET); }
@@ -33,7 +33,7 @@ static void uputs(const char *s){ HAL_UART_Transmit(NRF24_UART, (uint8_t*)s, str
 #define T_LONG   1000U
 
 /* ==== Low-level SPI access ============================================== */
-static void nrf24_WriteReg(uint8_t reg, uint8_t val)
+void nrf24_WriteReg(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2];
     buf[0] = (uint8_t)(W_REGISTER | (reg & REGISTER_MASK));
@@ -42,8 +42,7 @@ static void nrf24_WriteReg(uint8_t reg, uint8_t val)
     HAL_SPI_Transmit(NRF24_SPI, buf, 2, T_SHORT);
     CS_UnSelect();
 }
-
-static void nrf24_WriteRegMulti(uint8_t reg, const uint8_t *data, int size)
+void nrf24_WriteRegMulti(uint8_t reg, const uint8_t *data, int size)
 {
     uint8_t cmd = (uint8_t)(W_REGISTER | (reg & REGISTER_MASK));
     CS_Select();
@@ -52,7 +51,7 @@ static void nrf24_WriteRegMulti(uint8_t reg, const uint8_t *data, int size)
     CS_UnSelect();
 }
 
-static uint8_t nrf24_ReadReg(uint8_t reg)
+ uint8_t nrf24_ReadReg(uint8_t reg)
 {
     uint8_t cmd = (uint8_t)(R_REGISTER | (reg & REGISTER_MASK));
     uint8_t val = 0;
@@ -296,4 +295,11 @@ void NRF24_Dump(void)
 
     v = nrf24_ReadReg(STATUS);     hex1("STAT",  v);
     uputs("\r\n");
+}
+uint8_t NRF24_StatusNOP(void) {
+    uint8_t cmd = NOP, st = 0x00;
+    CS_Select();
+    HAL_SPI_TransmitReceive(NRF24_SPI, &cmd, &st, 1, 100);
+    CS_UnSelect();
+    return st;
 }
