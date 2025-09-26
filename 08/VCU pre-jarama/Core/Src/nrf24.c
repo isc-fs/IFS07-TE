@@ -8,8 +8,8 @@
 #include <stdio.h>
 
 /* ==== Hardware bindings (edit only if your pins change) ==== */
-extern SPI_HandleTypeDef  hspi2;
-#define NRF24_SPI        (&hspi2)
+extern SPI_HandleTypeDef  hspi1;
+#define NRF24_SPI        (&hspi1)
 
 extern UART_HandleTypeDef huart2;     /* ECU prints go through USART2 */
 #define NRF24_UART       (&huart2)

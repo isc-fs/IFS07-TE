@@ -57,7 +57,7 @@ FDCAN_HandleTypeDef hfdcan3;
 
 SD_HandleTypeDef hsd1;
 
-SPI_HandleTypeDef hspi2;
+SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim16;
@@ -84,7 +84,7 @@ static void MX_TIM16_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_FDCAN3_Init(void);
-static void MX_SPI2_Init(void);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 /* USER CODE END PFP */
 
@@ -263,38 +263,7 @@ int main(void)
   MX_SDMMC1_SD_Init();
   MX_FATFS_Init();
   MX_FDCAN3_Init();
-  MX_SPI2_Init();
-  //SPI loopback para ver q pasa con MOSI y MISO
-  uint8_t tx[4] = {0xAA,0x55,0xF0,0x0F}, rx[4] = {0};
-  HAL_StatusTypeDef r = HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4, 100);
-  char s[80];
-  snprintf(s,sizeof(s),"SPI2 loopback: st=%d  RX=%02X %02X %02X %02X\r\n",
-           (int)r, rx[0],rx[1],rx[2],rx[3]);
-  print(s);
-  //LEctura de pines del NRF 24 para entender qué cojones está ocurriendo
-  {
-      char t[64];
-      snprintf(t, sizeof t,
-               "[NRF-PINS] CE=%d CSN=%d\r\n",
-               HAL_GPIO_ReadPin(NRF24_CE_PORT,  NRF24_CE_PIN),
-               HAL_GPIO_ReadPin(NRF24_CSN_PORT, NRF24_CSN_PIN));
-      HAL_UART_Transmit(&huart2, (uint8_t*)t, strlen(t), HAL_MAX_DELAY);
-
-      // Optional: force a quick toggle to see CSN really moves
-      HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_RESET);
-      HAL_Delay(1);
-      snprintf(t, sizeof t, "[NRF-PINS] CSN_LOW -> CE=%d CSN=%d\r\n",
-               HAL_GPIO_ReadPin(NRF24_CE_PORT,  NRF24_CE_PIN),
-               HAL_GPIO_ReadPin(NRF24_CSN_PORT, NRF24_CSN_PIN));
-      HAL_UART_Transmit(&huart2, (uint8_t*)t, strlen(t), HAL_MAX_DELAY);
-
-      HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET);
-      HAL_Delay(1);
-      snprintf(t, sizeof t, "[NRF-PINS] CSN_HIGH -> CE=%d CSN=%d\r\n",
-               HAL_GPIO_ReadPin(NRF24_CE_PORT,  NRF24_CE_PIN),
-               HAL_GPIO_ReadPin(NRF24_CSN_PORT, NRF24_CSN_PIN));
-      HAL_UART_Transmit(&huart2, (uint8_t*)t, strlen(t), HAL_MAX_DELAY);
-  }
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
 	// Inicializar tarjeta microSD
 	//SDCard_start();
@@ -697,8 +666,6 @@ void SystemClock_Config(void)
   /** Supply configuration update enable
   */
   HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
-  HAL_PWREx_EnableVddIO2();
-
 
   /** Configure the main internal regulator output voltage
   */
@@ -1137,50 +1104,50 @@ static void MX_SDMMC1_SD_Init(void)
 }
 
 /**
-  * @brief SPI2 Initialization Function
+  * @brief SPI1 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_SPI2_Init(void)
+static void MX_SPI1_Init(void)
 {
 
-  /* USER CODE BEGIN SPI2_Init 0 */
+  /* USER CODE BEGIN SPI1_Init 0 */
 
-  /* USER CODE END SPI2_Init 0 */
+  /* USER CODE END SPI1_Init 0 */
 
-  /* USER CODE BEGIN SPI2_Init 1 */
+  /* USER CODE BEGIN SPI1_Init 1 */
 
-  /* USER CODE END SPI2_Init 1 */
-  /* SPI2 parameter configuration*/
-  hspi2.Instance = SPI2;
-  hspi2.Init.Mode = SPI_MODE_MASTER;
-  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
-  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi2.Init.CRCPolynomial = 0x0;
-  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
-  hspi2.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
-  hspi2.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
-  hspi2.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
-  hspi2.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
-  hspi2.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
-  hspi2.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
-  hspi2.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
-  hspi2.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
-  hspi2.Init.IOSwap = SPI_IO_SWAP_DISABLE;
-  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 0x0;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi1.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi1.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi1.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi1.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi1.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi1.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi1.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi1.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi1.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SPI2_Init 2 */
+  /* USER CODE BEGIN SPI1_Init 2 */
 
-  /* USER CODE END SPI2_Init 2 */
+  /* USER CODE END SPI1_Init 2 */
 
 }
 
@@ -1465,11 +1432,22 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(DS18B20_Data_GPIO_Port, &GPIO_InitStruct);
 
+  // --- ADD: SPI1 pins on PA5/PA6/PA7 (AF5) ---
+  GPIO_InitStruct.Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;            // MISO can be PULLDOWN if you prefer
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;  // High for SPI
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+
+
   /*Configure GPIO pin : START_BUTTON1_Pin */
   GPIO_InitStruct.Pin = START_BUTTON1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(START_BUTTON1_GPIO_Port, &GPIO_InitStruct);
+
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* --- nRF24 CE/CSN pins (PG3=CSN idle HIGH, PC6=CE idle LOW) --- */
