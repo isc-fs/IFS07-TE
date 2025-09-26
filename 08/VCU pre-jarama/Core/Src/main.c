@@ -264,6 +264,37 @@ int main(void)
   MX_FATFS_Init();
   MX_FDCAN3_Init();
   MX_SPI2_Init();
+  //SPI loopback para ver q pasa con MOSI y MISO
+  uint8_t tx[4] = {0xAA,0x55,0xF0,0x0F}, rx[4] = {0};
+  HAL_StatusTypeDef r = HAL_SPI_TransmitReceive(&hspi2, tx, rx, 4, 100);
+  char s[80];
+  snprintf(s,sizeof(s),"SPI2 loopback: st=%d  RX=%02X %02X %02X %02X\r\n",
+           (int)r, rx[0],rx[1],rx[2],rx[3]);
+  print(s);
+  //LEctura de pines del NRF 24 para entender qué cojones está ocurriendo
+  {
+      char t[64];
+      snprintf(t, sizeof t,
+               "[NRF-PINS] CE=%d CSN=%d\r\n",
+               HAL_GPIO_ReadPin(NRF24_CE_PORT,  NRF24_CE_PIN),
+               HAL_GPIO_ReadPin(NRF24_CSN_PORT, NRF24_CSN_PIN));
+      HAL_UART_Transmit(&huart2, (uint8_t*)t, strlen(t), HAL_MAX_DELAY);
+
+      // Optional: force a quick toggle to see CSN really moves
+      HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_RESET);
+      HAL_Delay(1);
+      snprintf(t, sizeof t, "[NRF-PINS] CSN_LOW -> CE=%d CSN=%d\r\n",
+               HAL_GPIO_ReadPin(NRF24_CE_PORT,  NRF24_CE_PIN),
+               HAL_GPIO_ReadPin(NRF24_CSN_PORT, NRF24_CSN_PIN));
+      HAL_UART_Transmit(&huart2, (uint8_t*)t, strlen(t), HAL_MAX_DELAY);
+
+      HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET);
+      HAL_Delay(1);
+      snprintf(t, sizeof t, "[NRF-PINS] CSN_HIGH -> CE=%d CSN=%d\r\n",
+               HAL_GPIO_ReadPin(NRF24_CE_PORT,  NRF24_CE_PIN),
+               HAL_GPIO_ReadPin(NRF24_CSN_PORT, NRF24_CSN_PIN));
+      HAL_UART_Transmit(&huart2, (uint8_t*)t, strlen(t), HAL_MAX_DELAY);
+  }
   /* USER CODE BEGIN 2 */
 	// Inicializar tarjeta microSD
 	//SDCard_start();
@@ -666,6 +697,8 @@ void SystemClock_Config(void)
   /** Supply configuration update enable
   */
   HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+  HAL_PWREx_EnableVddIO2();
+
 
   /** Configure the main internal regulator output voltage
   */
