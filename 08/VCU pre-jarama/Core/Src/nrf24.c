@@ -125,7 +125,15 @@ static void nrf24_reset(uint8_t reg)
 
 void NRF24_Init(void)
 {
-    CE_Disable();
+	CE_Disable();
+	CS_UnSelect();
+	HAL_Delay(1);
+
+	// ACTIVATE 0x73 (needed by many BK24xx/nRF24 clones)
+	uint8_t act[2] = { ACTIVATE, 0x73 };
+	CS_Select(); HAL_SPI_Transmit(NRF24_SPI, act, 2, T_SHORT); CS_UnSelect();
+	HAL_Delay(1);
+
     nrf24_reset(0);
 
     /* fixed settings for link bring-up */
@@ -140,7 +148,7 @@ void NRF24_Init(void)
     nrf24_WriteReg(FIFO_STATUS,  0x11);
     nrf24_WriteReg(STATUS,       0x70);  /* clear IRQs */
 
-    CE_Enable();    /* power state will be set in TxMode/RxMode */
+    //CE_Enable();    /* power state will be set in TxMode/RxMode */
 }
 
 void NRF24_TxMode(uint8_t *Address, uint8_t channel)
@@ -154,50 +162,11 @@ void NRF24_TxMode(uint8_t *Address, uint8_t channel)
     /* CONFIG: PWR_UP(1) | EN_CRC(1) | CRCO(1=16bit) | PRIM_RX(0) */
     uint8_t cfg = (1<<1) | (1<<3) | (1<<2);   /* 0x0E */
     nrf24_WriteReg(CONFIG, cfg);
+    HAL_Delay(3);
 
-    CE_Enable();
+    //CE_Enable();
 }
 
-uint8_t NRF24_Transmit(uint8_t *data)   /* 32 bytes */
-{
-    uint8_t cmd, status;
-    uint32_t t0;
-
-    CE_Disable();
-
-    /* load TX FIFO */
-    cmd = W_TX_PAYLOAD;
-    CS_Select();
-    HAL_SPI_Transmit(NRF24_SPI, &cmd, 1, T_SHORT);
-    HAL_SPI_Transmit(NRF24_SPI, data, 32, T_LONG);
-    CS_UnSelect();
-
-    /* pulse CE >= 10us */
-    CE_Enable();
-    for (volatile int i = 0; i < 400; i++) { __NOP(); }
-    CE_Disable();
-
-    /* wait for TX_DS or MAX_RT, ~5 ms timeout */
-    t0 = HAL_GetTick();
-    do {
-        status = nrf24_ReadReg(STATUS);
-        if (status & (1<<5)) break; /* TX_DS */
-        if (status & (1<<4)) break; /* MAX_RT */
-    } while ((HAL_GetTick() - t0) < 5);
-
-    /* clear IRQ flags */
-    nrf24_WriteReg(STATUS, (1<<5) | (1<<4) | (1<<6));
-
-    if (status & (1<<4)) {
-        nrf24_SendCmd(FLUSH_TX);
-        char msg[64];
-        uint8_t ob = nrf24_ReadReg(OBSERVE_TX);
-        snprintf(msg, sizeof(msg), "[TX] MAX_RT. STATUS=%02X OBSERVE_TX=%02X\r\n", status, ob);
-        HAL_UART_Transmit(NRF24_UART, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-        return 0;
-    }
-    return (status & (1<<5)) ? 1 : 0;
-}
 
 void NRF24_RxMode(uint8_t *Address, uint8_t channel)
 {
@@ -303,3 +272,96 @@ uint8_t NRF24_StatusNOP(void) {
     CS_UnSelect();
     return st;
 }
+
+// nrf24.c (helpers; keep static if you already have similar)
+static inline void csn_low(void){ HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_RESET); }
+static inline void csn_high(void){ HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET); }
+static inline void ce_low(void){ HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_RESET); }
+static inline void ce_high(void){ HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_SET); }
+
+uint8_t NRF24_ClearIRQs(void){         // clear RX_DR/TX_DS/MAX_RT
+    nrf24_WriteReg(STATUS, 0x70);
+    return nrf24_ReadReg(STATUS);
+}
+
+void NRF24_FlushTX(void){
+    uint8_t cmd = 0xE1; csn_low(); HAL_SPI_Transmit(NRF24_SPI, &cmd, 1, 100); csn_high();
+}
+void NRF24_FlushRX(void){
+    uint8_t cmd = 0xE2; csn_low(); HAL_SPI_Transmit(NRF24_SPI, &cmd, 1, 100); csn_high();
+}
+
+uint8_t NRF24_TxFIFOEmpty(void){
+    return (nrf24_ReadReg(FIFO_STATUS) & 0x10) ? 1u : 0u; // TX_EMPTY bit
+}
+
+// Make sure your Init() does ACTIVATE (0x50 0x73) ONCE after power-up.
+// You can fold this into NRF24_Init() if not already present.
+
+// Robust TX that: clears flags, flushes if needed, loads payload, pulses CE, waits for TX_DS/MAX_RT
+uint8_t NRF24_Transmit(const uint8_t *payload32)
+{
+    // 1) Recover if TX_FULL or not empty (stale data)
+    uint8_t st = nrf24_ReadReg(STATUS);
+    uint8_t fifo = nrf24_ReadReg(FIFO_STATUS);
+    if ((st & 0x01) || !(fifo & 0x10)) {   // TX_FULL==1 or TX_EMPTY==0
+        NRF24_ClearIRQs();
+        NRF24_FlushTX();
+    }
+
+    // 2) Write payload (32 bytes expected by your app)
+    uint8_t cmd = 0xA0; // W_TX_PAYLOAD
+    csn_low();
+    HAL_SPI_Transmit(NRF24_SPI, &cmd, 1, 100);
+    HAL_SPI_Transmit(NRF24_SPI, (uint8_t*)payload32, 32, 100);
+    csn_high();
+
+    // 3) CE pulse (>10us). Keep it tiny; no HAL_Delay here.
+    ce_high();
+    // ~10–20us NOPs (H7 is fast: ~800 NOPs is plenty)
+    for (volatile int i=0; i<20000; ++i) __NOP();
+    ce_low();
+
+    // 4) Wait a very short time for TX_DS or MAX_RT (fire-and-forget if EN_AA=0)
+    uint32_t t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < 5) {     // small 5ms guard
+        st = nrf24_ReadReg(STATUS);
+        if (st & (1u<<5)) {                // TX_DS
+            NRF24_ClearIRQs();
+            return 1;
+        }
+        if (st & (1u<<4)) {                // MAX_RT
+            NRF24_ClearIRQs();
+            NRF24_FlushTX();
+            return 0;
+        }
+        // If EN_AA is 0, TX_DS might not assert on some clones → still OK if FIFO empties
+        if (NRF24_TxFIFOEmpty()) {
+            NRF24_ClearIRQs();
+            return 1;
+        }
+    }
+
+    // Timeout → treat as fail, clean up
+    NRF24_ClearIRQs();
+    NRF24_FlushTX();
+    return 0;
+}
+
+// Optional: the “manual one-shot” TX you tested, as a callable driver helper
+void NRF24_ManualTxTest(void)
+{
+    NRF24_ClearIRQs(); NRF24_FlushTX(); NRF24_FlushRX();
+    nrf24_WriteReg(EN_AA, 0x00);
+    nrf24_WriteReg(SETUP_RETR, 0x00);
+
+    uint8_t cmd = 0xA0; uint8_t pkt[32];
+    for (int i=0;i<32;i++) pkt[i]=(uint8_t)(i+1);
+    csn_low(); HAL_SPI_Transmit(NRF24_SPI, &cmd, 1, 100);
+    HAL_SPI_Transmit(NRF24_SPI, pkt, 32, 100); csn_high();
+
+    ce_high();
+    for (volatile int i=0;i<800;i++) __NOP();
+    ce_low();
+}
+

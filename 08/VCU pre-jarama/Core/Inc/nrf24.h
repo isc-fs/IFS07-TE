@@ -39,7 +39,7 @@ extern "C" {
 /* ===== Public API ===== */
 void    NRF24_Init(void);
 void    NRF24_TxMode(uint8_t *addr5, uint8_t channel);
-uint8_t NRF24_Transmit(uint8_t *payload32);   /* payload must be 32 bytes */
+uint8_t NRF24_Transmit(const uint8_t *payload32);   /* payload must be 32 bytes */
 
 void    NRF24_RxMode(uint8_t *addr5, uint8_t channel);
 uint8_t NRF24_IsDataAvailable(int pipe);      /* 1 if data pending */
@@ -48,10 +48,8 @@ void    NRF24_Receive(uint8_t *payload32);    /* reads 32 bytes */
 void    NRF24_ReadAll(uint8_t *out);          /* debug snapshot */
 /* Public low-level accessors (needed by main.c and debug) */
 uint8_t nrf24_ReadReg(uint8_t Reg);
-void    nrf24_ReadReg_Multi(uint8_t Reg, uint8_t *data, int size);
 void    nrf24_WriteReg(uint8_t Reg, uint8_t Data);
 void    nrf24_WriteRegMulti(uint8_t Reg, const uint8_t *data, int size);
-void    nrfsendCmd(uint8_t cmd);
 void    NRF24_Dump(void);
 uint8_t NRF24_StatusNOP(void);   // read STATUS via NOP (SPI sanity check)
 

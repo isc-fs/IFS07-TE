@@ -277,13 +277,7 @@ int main(void)
   HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET);   // CSN high
   HAL_Delay(1);
 
-  // ---- IMPORTANT for BK24xx/nRF24 clones: ACTIVATE 0x73 ----
-  // Must be done once after power-up so register writes stick (FEATURE/DYNPD/CONFIG etc.)
-  uint8_t act[2] = { 0x50, 0x73 };  // 0x50 = ACTIVATE, payload = 0x73
-  CSN_LOW();
-  HAL_SPI_Transmit(&hspi1, act, 2, 100);
-  CSN_HIGH();
-  HAL_Delay(1);
+
 
   // Sanity: write CONFIG=0x0B and read it back
   uint8_t w_cfg[2] = { (uint8_t)(0x20 | 0x00), 0x0B }; // W_REGISTER|CONFIG = 0x0B
@@ -298,13 +292,12 @@ int main(void)
   HAL_UART_Transmit(&huart2, (uint8_t*)dbg, strlen(dbg), HAL_MAX_DELAY);
 
   // ---- proceed with your driver now ----
-  NRF24_Init();                             // will now be able to touch FEATURE/DYNPD
   HAL_Delay(5);
   uint8_t st = NRF24_StatusNOP();
   char m[64];
   snprintf(m,sizeof(m),"[NRF] STATUS via NOP = 0x%02X\r\n", st);
   HAL_UART_Transmit(&huart2,(uint8_t*)m,strlen(m),HAL_MAX_DELAY);
-
+  NRF24_Init();
   NRF24_TxMode(rf_addr, TEL_CHAN);
   NRF24_Dump();
   uint8_t cfg = nrf24_ReadReg(CONFIG);
@@ -320,7 +313,6 @@ int main(void)
 
 
   // ---- nRF24 bring-up ----
-  NRF24_Init();
   //Comentar para uso real
   //dummy transmission, comentar para CAN ID
   for (int i = 0; i < 10; ++i) {
