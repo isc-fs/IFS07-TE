@@ -93,7 +93,8 @@ static void MX_SPI1_Init(void);
 /* USER CODE BEGIN 0 */
 
 // ---------- TEL Testing ----------
-#define TEL_USE_DUMMY   1   // set 1 to test without CAN, 0 for real can data
+#define TEL_USE_DUMMY   0   // set 1 to test without CAN, 0 for real can data
+#define DEGUB 1 //Para todos los debuggers
 #define TEL_CHAN        76
 static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
 
@@ -116,6 +117,28 @@ volatile uint32_t tel_sent_fail = 0;   // nRF24 TX failures
 uint32_t lecturas_s1[N_LECTURAS] = {0};
 uint32_t lecturas_s2[N_LECTURAS] = {0};
 uint8_t index_s1 = 0, index_s2 = 0;
+
+//----------- PAQUETE DE TELEMETRÍA ----------
+typedef struct __attribute__((packed)) {
+    uint16_t id;     // e.g., 0x600..0x680
+    uint16_t seq;    // rolling counter
+    float    v1;
+    float    v2;
+    float    v3;
+    float    v4;
+    float    v5;
+    float    v6;
+    float    v7;
+} TelFrame;  // 2+2 + 7*4 = 32 bytes
+
+//RADIO ID
+enum {
+    TEL_ACCUM       = 0x600,  // DC bus + battery info
+    TEL_INVERTER    = 0x610,  // inverter state + RPM
+    TEL_DRIVER      = 0x620,  // pedals/sensors
+    TEL_INV_TEMPS   = 0x630,  // t_motor, t_igbt, t_air, i_actual
+    // add more as needed: 0x640..0x680
+};
 
 // ---------- VARIABLES DEL CAN ----------
 FDCAN_TxHeaderTypeDef TxHeader_Inv;
@@ -314,15 +337,19 @@ int main(void)
 
   // ---- nRF24 bring-up ----
   //Comentar para uso real
-  //dummy transmission, comentar para CAN ID
-  for (int i = 0; i < 10; ++i) {
+  //dummy transmission, en dummy 0 se transmite esto
+#if TEL_USE_DUMMY
+// ---- DUMMY WARM-UP TRANSMISSIONS (DISABLED) ----
+for (int i = 0; i < 10; ++i) {
     float pkt[8] = {0};
     pkt[0] = 0x600;          // ID
-    pkt[1] = 321.0f;     // some dummy values
+    pkt[1] = 321.0f;
     pkt[2] = 1234.0f;
     NRF24_Transmit((uint8_t*)pkt);
     HAL_Delay(100);
-  }
+}
+#endif
+
 
 
 	// EJEMPLO SDCARD
@@ -1628,12 +1655,30 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 					break;
 
 				case TX_STATE_4:
-					e_machine_rpm = (RxData_Inv[7] & 0x0F << 16) | RxData_Inv[8] << 8 | RxData_Inv[5];
-					if (e_machine_rpm & 0x80000)
-					{
-						e_machine_rpm |= 0xFFF0000;
-					}
-					break;
+				  if (RxHeader_Inv.DataLength == FDCAN_DLC_BYTES_8) {
+				      uint32_t raw = ((uint32_t)(RxData_Inv[7] & 0x0F) << 16) |
+				                     ((uint32_t)RxData_Inv[6] << 8) |
+				                     ((uint32_t)RxData_Inv[5]);
+				      // sign-extend 20-bit if needed
+				      if (raw & 0x80000u) raw |= 0xFFF00000u;
+				      e_machine_rpm = (int)raw;
+				  }
+				  break;
+
+				case TX_STATE_5:  //Temperaturas
+				  if (RxHeader_Inv.DataLength == FDCAN_DLC_BYTES_8) {
+				      inv_t_motor = RxData_Inv[0];  // REPLACE with real byte mapping
+				      inv_t_igbt  = RxData_Inv[1];  // REPLACE
+				      inv_t_air   = RxData_Inv[2];  // REPLACE
+				  }
+				  break;
+
+				case TX_STATE_6:  //Movidas inversor
+				  if (RxHeader_Inv.DataLength == FDCAN_DLC_BYTES_8) {
+				      inv_n_actual = (RxData_Inv[3] << 8) | RxData_Inv[2];   // REPLACE mapping
+				      inv_i_actual = (RxData_Inv[5] << 8) | RxData_Inv[4];   // REPLACE mapping
+				  }
+				  break;
 
 				case TX_STATE_7:
 					if (RxHeader_Inv.DataLength == 6)
@@ -2174,64 +2219,204 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 }
 
 // Packs 8 floats (32 bytes). f[0] is the "frame ID".
-static void tel_build_packet(float f[8]) {
-    memset(f, 0, 8*sizeof(float));
+static void tel_build_packet(TelFrame *p)
+{
+    static uint16_t seq = 0;
 
 #if TEL_USE_DUMMY
-    static uint16_t ids[] = {0x610,0x600,0x630,0x640,0x650,0x670,0x660,0x680};
-    static uint8_t idx = 0; if (++idx >= sizeof(ids)/sizeof(ids[0])) idx = 0;
+    static const uint16_t ids[] = { TEL_ACCUM, TEL_INVERTER, TEL_DRIVER, TEL_INV_TEMPS };
+    static uint8_t idx = 0;
+    if (++idx >= (sizeof(ids)/sizeof(ids[0]))) idx = 0;
+    p->id  = ids[idx];
+    p->seq = seq++;
 
-    f[0] = (float)ids[idx];
-    f[1] = (float)inv_dc_bus_voltage;
-    f[2] = (float)e_machine_rpm;
-    f[3] = (float)torque_total;
-    f[4] = (float)v_celda_min;
-    f[5] = (float)s1_aceleracion;
-    f[6] = (float)s2_aceleracion;
-    f[7] = (float)state;
+    switch (p->id) {
+    case TEL_ACCUM:
+        p->v1 = (float)inv_dc_bus_voltage;  // V
+        p->v2 = (float)inv_dc_bus_power;    // W (if used)
+        p->v3 = (float)v_celda_min;         // mV (3600.00 you saw)
+        p->v4 = 0; p->v5 = 0; p->v6 = 0; p->v7 = 0;
+        break;
+
+    case TEL_INVERTER:
+        p->v1 = (float)state;
+        p->v2 = (float)e_machine_rpm;
+        p->v3 = 0; p->v4 = 0; p->v5 = 0; p->v6 = 0; p->v7 = 0;
+        break;
+
+    case TEL_DRIVER:
+        p->v1 = (float)s1_aceleracion;
+        p->v2 = (float)s2_aceleracion;
+        p->v3 = (float)s_freno;
+        p->v4 = (float)torque_total;
+        p->v5 = 0; p->v6 = 0; p->v7 = 0;
+        break;
+
+    case TEL_INV_TEMPS:
+        p->v1 = (float)inv_t_motor;
+        p->v2 = (float)inv_t_igbt;
+        p->v3 = (float)inv_t_air;
+        p->v4 = (float)inv_n_actual;   // if you later fill these
+        p->v5 = (float)I_ACTUAL;       // (or use inv_i_actual variable)
+        p->v6 = 0; p->v7 = 0;
+        break;
+    }
 #else
-    // Example: one “ACCUM/DCBUS” style frame
-    f[0] = (float)0x600;
-    f[1] = (float)inv_dc_bus_voltage;
-    f[2] = (float)inv_dc_bus_power;   // if you populate it
-    f[3] = (float)e_machine_rpm;
-    f[4] = (float)torque_total;
-    f[5] = (float)v_celda_min;
-    f[6] = (float)s1_aceleracion;
-    f[7] = (float)s2_aceleracion;
+    // Pick a *fixed* topic per tick cadence – start with ACCUM (simple & useful)
+    p->id  = TEL_ACCUM;
+    p->seq = seq++;
+
+    p->v1 = (float)inv_dc_bus_voltage;
+    p->v2 = (float)inv_dc_bus_power;   // 0 if unused
+    p->v3 = (float)v_celda_min;
+    p->v4 = (float)e_machine_rpm;
+    p->v5 = (float)torque_total;
+    p->v6 = (float)s1_aceleracion;
+    p->v7 = (float)s2_aceleracion;
 #endif
+{
+    static uint16_t seq   = 0;
+    static uint8_t  which = 0;  // 0:0x600, 1:0x610, 2:0x620, 3:0x630
+
+    p->seq = seq++;
+
+#if TEL_USE_DUMMY
+    // ---------- DUMMY DATA (fabricated but consistent layout) ----------
+    // simple changing counters so the receiver/UI visibly updates
+    static float f = 0.0f; f += 1.0f; if (f > 9999.0f) f = 0.0f;
+
+    switch (which) {
+    default:
+    case 0: // 0x600 Powertrain basic
+        p->id = 0x600;
+        p->v1 = 350.0f + ((int)f % 50);     // inv_dc_bus_voltage
+        p->v2 = 1000.0f + 10.0f*((int)f);   // e_machine_rpm
+        p->v3 = (float)((int)f % 100);      // torque_total
+        p->v4 = 3600.0f;                    // v_celda_min
+        p->v5 = (float)((int)f % 7);        // state
+        p->v6 = 0.0f;
+        p->v7 = 0.0f;
+        break;
+
+    case 1: // 0x610 Inverter temps & currents
+        p->id = 0x610;
+        p->v1 = 40.0f + ((int)f % 20);      // inv_t_motor
+        p->v2 = 35.0f + ((int)f % 20);      // inv_t_igbt
+        p->v3 = 25.0f + ((int)f % 10);      // inv_t_air
+        p->v4 = 2000.0f + 5.0f*((int)f);    // inv_n_actual
+        p->v5 = 5.0f + 0.1f*((int)f);       // inv_i_actual
+        p->v6 = 0.0f; p->v7 = 0.0f;
+        break;
+
+    case 2: // 0x620 Driver inputs
+        p->id = 0x620;
+        p->v1 = (float)((int)f % 4096);     // s1_aceleracion
+        p->v2 = (float)((int)f % 4096);     // s2_aceleracion
+        p->v3 = (float)(((int)f % 2) ? 1500 : 500); // s_freno
+        p->v4 = (float)(((int)f / 8) % 2);  // precharge_button
+        p->v5 = (float)(((int)f / 16) % 2); // start_button_act
+        p->v6 = (float)(((int)f / 32) % 2); // dash_input_1
+        p->v7 = (float)(((int)f / 64) % 2); // dash_input_2
+        break;
+
+    case 3: // 0x630 Accumulator/HV summary
+        p->id = 0x630;
+        p->v1 = 350.0f + ((int)f % 50);     // inv_dc_bus_voltage (echo)
+        p->v2 = 0.0f; p->v3 = 0.0f; p->v4 = 0.0f;
+        p->v5 = 0.0f; p->v6 = 0.0f; p->v7 = 0.0f;
+        break;
+    }
+#else
+    // ---------- REAL DATA (from your CAN-parsed globals) ----------
+    switch (which) {
+    default:
+    case 0: // 0x600 Powertrain basic
+        p->id = 0x600;
+        p->v1 = (float)inv_dc_bus_voltage;
+        p->v2 = (float)e_machine_rpm;
+        p->v3 = (float)torque_total;
+        p->v4 = (float)v_celda_min;
+        p->v5 = (float)state;
+        p->v6 = 0.0f; p->v7 = 0.0f;
+        break;
+
+    case 1: // 0x610 Inverter temps & currents
+        p->id = 0x610;
+        p->v1 = (float)inv_t_motor;
+        p->v2 = (float)inv_t_igbt;
+        p->v3 = (float)inv_t_air;
+        p->v4 = (float)inv_n_actual;
+        p->v5 = (float)inv_i_actual;
+        p->v6 = 0.0f; p->v7 = 0.0f;
+        break;
+
+    case 2: // 0x620 Driver inputs
+        p->id = 0x620;
+        p->v1 = (float)s1_aceleracion;
+        p->v2 = (float)s2_aceleracion;
+        p->v3 = (float)s_freno;
+        p->v4 = (float)precharge_button;
+        p->v5 = (float)start_button_act;
+        /* --- Optional dashboard inputs (compile-safe) --- */
+        /* If you have real pins, define these in a header (e.g., VCU_pins.h):
+           #define DINPUT1_GPIO_Port   GPIOX
+           #define DINPUT1_Pin         GPIO_PIN_Y
+           #define DINPUT2_GPIO_Port   GPIOX
+           #define DINPUT2_Pin         GPIO_PIN_Z
+        */
+        #ifdef DINPUT1_GPIO_Port
+            p->v6 = (float)HAL_GPIO_ReadPin(DINPUT1_GPIO_Port, DINPUT1_Pin);
+        #else
+            p->v6 = 0.0f;   // no pin defined → safe default
+        #endif
+
+        #ifdef DINPUT2_GPIO_Port
+            p->v7 = (float)HAL_GPIO_ReadPin(DINPUT2_GPIO_Port, DINPUT2_Pin);
+        #else
+            p->v7 = 0.0f;   // no pin defined → safe default
+        #endif
+        break;
+
+    case 3: // 0x630 Accumulator/HV summary (extend later with AMS)
+        p->id = 0x630;
+        p->v1 = (float)inv_dc_bus_voltage;  // placeholder
+        p->v2 = 0.0f; p->v3 = 0.0f; p->v4 = 0.0f;
+        p->v5 = 0.0f; p->v6 = 0.0f; p->v7 = 0.0f;
+        break;
+    }
+#endif
+
+    if (++which > 3) which = 0;
 }
 
-static void tel_send_now(void) {
-    float pkt[8];
-    tel_build_packet(pkt);
 
-    // debug: print exactly what we'll TX
-    char msg[160];
-    int ent, dec;
-    snprintf(msg, sizeof(msg), "\r\n[TX] ID: 0x%X", (uint16_t)pkt[0]);
-    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    for (int j=1; j<8; ++j) {
-        ent = (int)pkt[j];
-        dec = (int)((pkt[j] - ent) * 100); if (dec < 0) dec = -dec;
-        snprintf(msg, sizeof(msg), ", V%d:%d.%02d", j, ent, dec);
-        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    }
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+static void tel_send_now(void)
+{
+    TelFrame pkt;
+    tel_build_packet(&pkt);
 
-    // TX over nRF24 (32 bytes)
-    uint8_t ok = NRF24_Transmit((uint8_t*)pkt);
+#if DEBUG
+    char msg[220];
+    int n = snprintf(msg, sizeof(msg), // @suppress("Float formatting support")
+        "\r\n[TX] ID: 0x%X seq:%u, V1:%.2f, V2:%.2f, V3:%.2f, V4:%.2f, V5:%.2f, V6:%.2f, V7:%.2f\r\n",
+        pkt.id, pkt.seq, pkt.v1, pkt.v2, pkt.v3, pkt.v4, pkt.v5, pkt.v6, pkt.v7);
+    if (n > 0) HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)n, HAL_MAX_DELAY);
+#endif
+
+    // Raw 32-byte TX (nRF24 payload)
+    uint8_t ok = NRF24_Transmit((uint8_t*)&pkt);
+
+#if DEBUG
     uint8_t st = nrf24_ReadReg(STATUS);
     uint8_t ob = nrf24_ReadReg(OBSERVE_TX);
+    const char *tag = ok ? "[TX] OK " : "[TX] FAIL ";
+    HAL_UART_Transmit(&huart2, (uint8_t*)tag, (uint16_t)strlen(tag), HAL_MAX_DELAY);
+    int n2 = snprintf(msg, sizeof(msg), "STATUS=%02X OBSERVE_TX=%02X\r\n", st, ob);
+    if (n2 > 0) HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)n2, HAL_MAX_DELAY);
+#endif
 
-    snprintf(msg, sizeof(msg), ok ? "[TX] OK " : "[TX] FAIL ");
-    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    snprintf(msg, sizeof(msg), "STATUS=%02X OBSERVE_TX=%02X\r\n", st, ob);
-    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    if (ok) tel_sent_ok++; else tel_sent_fail++;
 }
-
-
-
 
 /*
 void SDCard_start(void)
