@@ -38,7 +38,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define CSN_LOW()   HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_RESET)
+#define CSN_HIGH()  HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -267,36 +268,69 @@ int main(void)
   /* USER CODE BEGIN 2 */
 	// Inicializar tarjeta microSD
 	//SDCard_start();
-	//HAL_Delay(2000);
-  HAL_Delay(5);
-  uint8_t before = nrf24_ReadReg(CONFIG);
-  uint8_t test   = (uint8_t)~before;
-  nrf24_WriteReg(CONFIG, test);
-  HAL_Delay(1);
-  uint8_t echo   = nrf24_ReadReg(CONFIG);
-  char msg[80];
-  snprintf(msg,sizeof msg,"[NRF-PROBE] before=%02X wrote=%02X echo=%02X\r\n",before,test,echo);
-  HAL_UART_Transmit(&huart2,(uint8_t*)msg,strlen(msg),HAL_MAX_DELAY);
-  // restore
-  nrf24_WriteReg(CONFIG, 0x08);
+	//HAL_Delay(2000)
+  /* USER CODE BEGIN 2 */
+  HAL_Delay(5);  // let rails settle
 
-  // ---- nRF24 bring-up ----
-  NRF24_Init();
-  //Comentar para uso real
-  HAL_Delay(5);                      // small settle
+  // --- Keep radio idle while configuring ---
+  HAL_GPIO_WritePin(NRF24_CE_PORT,  NRF24_CE_PIN,  GPIO_PIN_RESET); // CE low
+  HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET);   // CSN high
+  HAL_Delay(1);
+
+  // ---- IMPORTANT for BK24xx/nRF24 clones: ACTIVATE 0x73 ----
+  // Must be done once after power-up so register writes stick (FEATURE/DYNPD/CONFIG etc.)
+  uint8_t act[2] = { 0x50, 0x73 };  // 0x50 = ACTIVATE, payload = 0x73
+  CSN_LOW();
+  HAL_SPI_Transmit(&hspi1, act, 2, 100);
+  CSN_HIGH();
+  HAL_Delay(1);
+
+  // Sanity: write CONFIG=0x0B and read it back
+  uint8_t w_cfg[2] = { (uint8_t)(0x20 | 0x00), 0x0B }; // W_REGISTER|CONFIG = 0x0B
+  uint8_t r_cfg[2] = { 0x00, 0xFF };                   // R_REGISTER|CONFIG, dummy
+  uint8_t rxw[2] = {0}, rxr[2] = {0};
+
+  CSN_LOW();  HAL_SPI_TransmitReceive(&hspi1, w_cfg, rxw, 2, 100);  CSN_HIGH();
+  CSN_LOW();  HAL_SPI_TransmitReceive(&hspi1, r_cfg, rxr, 2, 100);  CSN_HIGH();
+
+  char dbg[96];
+  snprintf(dbg, sizeof dbg, "[POST-ACTIVATE] status_w=%02X cfg=%02X\r\n", rxw[0], rxr[1]);
+  HAL_UART_Transmit(&huart2, (uint8_t*)dbg, strlen(dbg), HAL_MAX_DELAY);
+
+  // ---- proceed with your driver now ----
+  NRF24_Init();                             // will now be able to touch FEATURE/DYNPD
+  HAL_Delay(5);
   uint8_t st = NRF24_StatusNOP();
   char m[64];
   snprintf(m,sizeof(m),"[NRF] STATUS via NOP = 0x%02X\r\n", st);
   HAL_UART_Transmit(&huart2,(uint8_t*)m,strlen(m),HAL_MAX_DELAY);
 
   NRF24_TxMode(rf_addr, TEL_CHAN);
-  NRF24_Dump();                           // prints via UART for sanity
+  NRF24_Dump();
   uint8_t cfg = nrf24_ReadReg(CONFIG);
   uint8_t rf  = nrf24_ReadReg(RF_SETUP);
   uint8_t ch  = nrf24_ReadReg(RF_CH);
   char info[64];
   snprintf(info, sizeof(info), "[NRF] CFG=%02X RF=%02X CH=%u\r\n", cfg, rf, ch);
   HAL_UART_Transmit(&huart2, (uint8_t*)info, strlen(info), HAL_MAX_DELAY);
+  /* USER CODE END 2 */
+
+
+
+
+
+  // ---- nRF24 bring-up ----
+  NRF24_Init();
+  //Comentar para uso real
+  //dummy transmission, comentar para CAN ID
+  for (int i = 0; i < 10; ++i) {
+    float pkt[8] = {0};
+    pkt[0] = 0x600;          // ID
+    pkt[1] = 321.0f;     // some dummy values
+    pkt[2] = 1234.0f;
+    NRF24_Transmit((uint8_t*)pkt);
+    HAL_Delay(100);
+  }
 
 
 	// EJEMPLO SDCARD
@@ -406,12 +440,19 @@ int main(void)
 #endif
 
 	// Espera ACK inversor (DC bus)
+	//Comentar para CAN ID
+	HAL_TIM_Base_Start_IT(&htim16);
 	uint32_t _last_req_log = 0;
 	while (config_inv_lectura_v == 0)
 	{
 		if ((HAL_GetTick() - _last_req_log) >= 1000) {
 		        _last_req_log = HAL_GetTick();
 		        print("Solicitar tensión inversor");
+		    }
+		static uint32_t last = 0;
+		    if (HAL_GetTick() - last >= 500) {
+		        last = HAL_GetTick();
+		        tel_send_now();   // sends one 32-byte frame
 		    }
 		if (config_inv_lectura_v == 1)
 		{
@@ -507,7 +548,8 @@ int main(void)
 	 * timer count = 2640000 / 264 = 10000
 	 */
 #if !CALIBRATION
-	HAL_TIM_Base_Start_IT(&htim16);
+	//Descomentar para CAN ID
+	//HAL_TIM_Base_Start_IT(&htim16);
 #endif
 
 #if 1
@@ -645,7 +687,13 @@ int main(void)
 		             inv_dc_bus_voltage, e_machine_rpm, state);
 		    HAL_UART_Transmit(&huart2, (uint8_t*)hb, strlen(hb), HAL_MAX_DELAY);
 		    last_irq_seen = tel_irq_cnt;
+
 		}
+
+		if (tel_tick >= 500) {
+		        tel_tick = 0;          // consume the tick
+		        tel_send_now();        // SPI + UART OK here (foreground)
+		    }
 
     /* USER CODE END WHILE */
 
@@ -1432,22 +1480,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(DS18B20_Data_GPIO_Port, &GPIO_InitStruct);
 
-  // --- ADD: SPI1 pins on PA5/PA6/PA7 (AF5) ---
-  GPIO_InitStruct.Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;            // MISO can be PULLDOWN if you prefer
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;  // High for SPI
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-
-
   /*Configure GPIO pin : START_BUTTON1_Pin */
   GPIO_InitStruct.Pin = START_BUTTON1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(START_BUTTON1_GPIO_Port, &GPIO_InitStruct);
-
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* --- nRF24 CE/CSN pins (PG3=CSN idle HIGH, PC6=CE idle LOW) --- */
@@ -1458,7 +1495,7 @@ static void MX_GPIO_Init(void)
 
   GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull  = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
 
   GPIO_InitStruct.Pin = NRF24_CSN_PIN;
   HAL_GPIO_Init(NRF24_CSN_PORT, &GPIO_InitStruct);
@@ -1880,10 +1917,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		/* --- Telemetry tick: 10ms base --- */
 		    tel_irq_cnt++;                // <--- ADD
 		    tel_tick += 10;
-		    if (tel_tick >= 500) {        // 500 ms cadence
-		        tel_tick = 0;
-		        tel_send_now();           // 32B nRF24 burst (no prints from ISR)
-		    }
 
 		    (void)HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu);
 
