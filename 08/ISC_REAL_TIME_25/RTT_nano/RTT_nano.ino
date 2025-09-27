@@ -23,7 +23,7 @@ static const uint8_t SOF1 = 0xAA;
 static const uint8_t SOF2 = 0x55;
 
 // Toggle console verbosity
-#define VERBOSE 0   // 0: silent framing only | 1: +HEX dump and radio details
+#define VERBOSE 0  // 0: silent framing only | 1: +HEX dump and radio details
 
 // ------------------ Globals ------------------
 uint8_t buf[PAYLOAD];

@@ -1,596 +1,681 @@
+# ui.py
 """
-Interfaz Gráfica para Sistema de Telemetría Formula Student
-Muestra datos en tiempo real con cuadros informativos y gráficos
+ISCmetrics - Real-Time Telemetry UI
+- Fullscreen dark UI
+- Select COM port & baudrate
+- Optional InfluxDB (Option A backend)
+- Excel logging to ./logs via backend
+- Debug toggle that streams backend logs into the UI
 """
 
 import os
+import sys
+import time
+import queue
+import threading
+import subprocess
 import tkinter as tk
 import tkinter.scrolledtext as st
 from tkinter import ttk, messagebox
-import threading
-import queue
-import time
+import logging
+
+# Backend
 import ISC_RTT_serial as ISC_RTT
-from PIL import Image, ImageTk
-import sys, os
+
+# ---- Matplotlib in Tk ----
+import matplotlib
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
 from collections import deque
 
+# Optional logo
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None
+    ImageTk = None
+
+# For Linux headless issues
 if sys.platform.startswith("linux") and "DISPLAY" not in os.environ:
     os.environ["DISPLAY"] = ":0"
 
+
+# -------- logger -> Tk text handler --------
+class TkTextHandler(logging.Handler):
+    """Send logging records to a Tkinter ScrolledText safely."""
+    def __init__(self, text_widget: st.ScrolledText):
+        super().__init__()
+        self.text_widget = text_widget
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            ts = time.strftime("%H:%M:%S")
+            def append():
+                self.text_widget.insert(tk.END, f"[{ts}] {msg}\n")
+                self.text_widget.see(tk.END)
+                # trim lines
+                lines = self.text_widget.get("1.0", tk.END).split("\n")
+                if len(lines) > 600:
+                    self.text_widget.delete("1.0", f"{len(lines)-600}.0")
+            # schedule on UI thread
+            self.text_widget.after(0, append)
+        except Exception:
+            self.handleError(record)
+
+
 class TelemetryUI:
-    """Clase principal para la interfaz de telemetría"""
-    
     def __init__(self):
+        # Root FIRST (fixes "Too early to create variable")
+        self.root = tk.Tk()
+        self.root.title("ISCmetrics")
+        self.root.attributes("-fullscreen", True)
+        self.root.configure(bg="#101010")
+
+        self.tk_logo = None  # keep ref if we set iconphoto
+
         self.setup_data_structures()
         self.setup_ui()
-        
-        #self.setup_threads()
+        self.setup_logging_bridge()  # after widgets exist
 
-    def setup_threads(self):
-        pass  # Placeholder if needed for future thread setup
-
-    def minimize_window(self):
-        """Minimiza la ventana de la aplicación"""
-        if self.root.attributes('-fullscreen'):
-            self.root.attributes('-fullscreen', False)
-        self.root.iconify()
-
-    def close_window(self):
-        """Cierra la ventana de la aplicación"""
-        self.exit_program()
-
-    
-        
+    # -------------------- Infra de estado --------------------
     def setup_data_structures(self):
-        """Inicializa las estructuras de datos para la telemetría"""
-        # Colas para comunicación entre threads
+        """Inicializa estructuras de datos / estado UI"""
         self.data_queue = queue.Queue()
-        
-        # Flags de control
+
+        # Flags/threads
         self.receiving_flag = False
         self.stop_data = False
-        
-        # Threads
         self.receiving_thread = None
         self.ui_update_thread = None
-        
-        # Datos históricos para gráficos (últimos 100 valores)
-        self.throttle_history = deque(maxlen=100)
-        self.brake_history = deque(maxlen=100)
-        self.time_history = deque(maxlen=100)
-        
-        # Listas de pilotos y circuitos
-        self.pilots_list = ["J. Landa", "M. Lorenzo", "A. Montero", "F. Tobar", "Chefo"]
+
+        # Historias para plots
+        self.throttle_history = deque(maxlen=200)
+        self.brake_history   = deque(maxlen=200)
+        self.time_history    = deque(maxlen=200)
+
+        # Listas demo
+        self.pilots_list   = ["J. Landa", "M. Lorenzo", "A. Montero", "F. Tobar", "Chefo"]
         self.circuits_list = ["Boadilla", "Jarama", "Montmeló", "Hockenheim"]
 
+        # Tk variables (root already exists)
+        self.selected_port = tk.StringVar(self.root, value="")
+        self.selected_baud = tk.IntVar(self.root, value=115200)
+        self.use_influx_var = tk.BooleanVar(self.root, value=False)
+        self.debug_var      = tk.BooleanVar(self.root, value=True)   # <-- NEW: default ON to learn
+        self.piloto_var    = tk.StringVar(self.root, value=self.pilots_list[0])
+        self.circuito_var  = tk.StringVar(self.root, value=self.circuits_list[0])
+        self.status_var    = tk.StringVar(self.root, value="Listo.")
+
+    # -------------------- UI raíz --------------------
     def setup_ui(self):
-        """Configura la interfaz de usuario"""
-        # Ventana principal
-        self.root = tk.Tk()
-        self.root.title("ISC Real-Time Telemetry")
-        self.root.attributes('-fullscreen', True)
-        self.root.configure(bg="#101010")
-        
-        # Configurar grid principal
-        for i in range(6):
+        # Grid root
+        for i in range(8):
             self.root.grid_columnconfigure(i, weight=1)
         for i in range(8):
             self.root.grid_rowconfigure(i, weight=1)
-        
+
         self.create_header()
         self.create_controls()
         self.create_data_displays()
         self.create_graphs()
+        self.create_statusbar()
         self.setup_bindings()
 
-    def create_header(self):
-        """Header con logo+título centrado y botones de ventana a la derecha"""
-            # --- fila 0: una barra horizontal con 3 zonas (izq, centro, dcha) ---
-        # 6 columnas ya configuradas en setup_ui()
-        # Zona centro: título con (opcional) logo
-        center_frame = tk.Frame(self.root, bg="#101010")
-        center_frame.grid(row=0, column=0, columnspan=6, sticky="n", pady=10)
+        # Rellenar combo de puertos al inicio
+        self.refresh_ports()
 
-        try:
-            from PIL import Image, ImageTk
-            logo = Image.open("ISC_REAL_TIME_25/isc_logo.png")
-            logo = logo.resize((50, 50), Image.Resampling.LANCZOS)
-            self.tk_logo = ImageTk.PhotoImage(logo)
-            title = tk.Label(
-                center_frame,
-                text="ISC Real-Time Telemetry",
-                font=("Inter", 22, "bold"),
-                fg="#FFFFFF",
-                bg="#101010",
-                image=self.tk_logo,
-                compound="left",
-                padx=10,
-            )
-        except Exception:
-            title = tk.Label(
-                center_frame,
-                text="ISC Real-Time Telemetry",
-                font=("Inter", 22, "bold"),
-                fg="#FFFFFF",
-                bg="#101010",
-            )
+    def setup_bindings(self):
+        self.root.bind("<Escape>", self.close_fullscreen)
+        self.root.bind("<F11>", self.toggle_fullscreen)
+        self.root.bind("<Control-m>", lambda e: self.minimize_window())
+
+    # -------------------- Header --------------------
+    def create_header(self):
+        center_frame = tk.Frame(self.root, bg="#101010")
+        center_frame.grid(row=0, column=0, columnspan=8, sticky="n", pady=10)
+
+        title_kwargs = dict(
+            text="ISCmetrics",
+            font=("Inter", 22, "bold"),
+            fg="#FFFFFF",
+            bg="#101010",
+        )
+
+        icon_set = False
+        if Image and ImageTk:
+            try:
+                # Try .ico for the window icon first
+                ico_path = os.path.join("ISC_REAL_TIME_25", "isc_logo.ico")
+                if os.path.exists(ico_path) and sys.platform.startswith("win"):
+                    try:
+                        self.root.iconbitmap(ico_path)
+                        icon_set = True
+                    except Exception:
+                        icon_set = False
+
+                # PNG for title + iconphoto fallback
+                png_path = os.path.join("ISC_REAL_TIME_25", "isc_logo.png")
+                if os.path.exists(png_path):
+                    logo = Image.open(png_path)
+                    logo = logo.resize((50, 50), Image.Resampling.LANCZOS)
+                    self.tk_logo = ImageTk.PhotoImage(logo)
+                    if not icon_set:
+                        try:
+                            self.root.iconphoto(True, self.tk_logo)
+                        except Exception:
+                            pass
+                    title = tk.Label(center_frame, image=self.tk_logo, compound="left", padx=10, **title_kwargs)
+                else:
+                    title = tk.Label(center_frame, **title_kwargs)
+            except Exception:
+                title = tk.Label(center_frame, **title_kwargs)
+        else:
+            title = tk.Label(center_frame, **title_kwargs)
         title.pack()
 
-        # Zona derecha: botones minimizar y cerrar
         right_frame = tk.Frame(self.root, bg="#101010")
-        right_frame.grid(row=0, column=5, sticky="ne", padx=10, pady=10)
+        right_frame.grid(row=0, column=7, sticky="ne", padx=10, pady=10)
 
         btn_min = tk.Button(
-            right_frame, text="—",  # guion largo
-            font=("Inter", 14, "bold"),
+            right_frame, text="—", font=("Inter", 14, "bold"),
             fg="#FFFFFF", bg="#303030", activebackground="#505050",
             width=3, borderwidth=0, command=self.minimize_window
         )
         btn_min.pack(side="left", padx=(0, 6))
 
         btn_close = tk.Button(
-            right_frame, text="×",
-            font=("Inter", 14, "bold"),
+            right_frame, text="×", font=("Inter", 14, "bold"),
             fg="#FFFFFF", bg="#C43131", activebackground="#E04B4B",
             width=3, borderwidth=0, command=self.close_window
         )
         btn_close.pack(side="left")
 
-        
-
+    # -------------------- Controles superiores --------------------
     def create_controls(self):
-        """Selectores centrados bajo el título y botones debajo"""
-        # Marco principal centrado para selects
+        # Selects (fila 1)
         selects_frame = tk.Frame(self.root, bg="#101010")
-        selects_frame.grid(row=1, column=0, columnspan=6, sticky="n", pady=(5, 0))
+        selects_frame.grid(row=1, column=0, columnspan=8, sticky="n", pady=(5, 0))
 
-        # Submarco con grid de 2 columnas (Piloto | Circuito)
         form = tk.Frame(selects_frame, bg="#101010")
         form.pack()
 
-        # Variables
-        self.piloto_var = tk.StringVar(self.root, value=self.pilots_list[0])
-        self.circuito_var = tk.StringVar(self.root, value=self.circuits_list[0])
-
         # Piloto
-        pilot_label = tk.Label(form, text="Piloto", font=("Inter", 14),
-                            fg="#FFFFFF", bg="#101010")
-        pilot_label.grid(row=0, column=0, padx=10, pady=(5, 2), sticky="s")
+        tk.Label(form, text="Piloto", font=("Inter", 14), fg="#FFFFFF", bg="#101010").grid(
+            row=0, column=0, padx=10, pady=(5, 2), sticky="s"
+        )
         self.pilot_menu = tk.OptionMenu(form, self.piloto_var, *self.pilots_list)
-        self.pilot_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020",
-                            highlightthickness=0, bd=0)
+        self.pilot_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020", highlightthickness=0, bd=0)
         self.pilot_menu.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
 
         # Circuito
-        circuit_label = tk.Label(form, text="Circuito", font=("Inter", 14),
-                                fg="#FFFFFF", bg="#101010")
-        circuit_label.grid(row=0, column=1, padx=10, pady=(5, 2), sticky="s")
+        tk.Label(form, text="Circuito", font=("Inter", 14), fg="#FFFFFF", bg="#101010").grid(
+            row=0, column=1, padx=10, pady=(5, 2), sticky="s"
+        )
         self.circuit_menu = tk.OptionMenu(form, self.circuito_var, *self.circuits_list)
-        self.circuit_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020",
-                                highlightthickness=0, bd=0)
+        self.circuit_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020", highlightthickness=0, bd=0)
         self.circuit_menu.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="ew")
 
-        # Marco para botones debajo de los selects
-        buttons_frame = tk.Frame(self.root, bg="#101010")
-        buttons_frame.grid(row=2, column=0, columnspan=6, sticky="n", pady=(0, 10))
+        # Puerto serie + Baud + Influx + Debug (fila 2)
+        io_frame = tk.Frame(self.root, bg="#101010")
+        io_frame.grid(row=2, column=0, columnspan=8, sticky="n", pady=(0, 10))
 
+        # Puerto
+        tk.Label(io_frame, text="Puerto", font=("Inter", 12), fg="#FFFFFF", bg="#101010").grid(
+            row=0, column=0, padx=(0, 8), pady=2
+        )
+        self.port_combo = ttk.Combobox(io_frame, textvariable=self.selected_port, width=24, state="readonly")
+        self.port_combo.grid(row=0, column=1, padx=(0, 8), pady=2)
+
+        btn_refresh = tk.Button(
+            io_frame, text="Actualizar", font=("Inter", 12),
+            fg="#FFFFFF", bg="#303030", activebackground="#505050",
+            command=self.refresh_ports
+        )
+        btn_refresh.grid(row=0, column=2, padx=(0, 16), pady=2)
+
+        # Baud
+        tk.Label(io_frame, text="Baud", font=("Inter", 12), fg="#FFFFFF", bg="#101010").grid(
+            row=0, column=3, padx=(0, 8), pady=2
+        )
+        self.baud_entry = tk.Entry(io_frame, textvariable=self.selected_baud, width=10, bg="#202020", fg="#00FF00")
+        self.baud_entry.grid(row=0, column=4, padx=(0, 16), pady=2)
+
+        # Influx toggle
+        self.influx_chk = tk.Checkbutton(
+            io_frame, text="Usar InfluxDB", variable=self.use_influx_var,
+            onvalue=True, offvalue=False, font=("Inter", 12),
+            fg="#FFFFFF", bg="#101010", activebackground="#101010",
+            selectcolor="#202020"
+        )
+        self.influx_chk.grid(row=0, column=5, padx=(0, 16), pady=2, sticky="w")
+
+        # Debug toggle
+        self.debug_chk = tk.Checkbutton(
+            io_frame, text="Debug", variable=self.debug_var,
+            onvalue=True, offvalue=False, font=("Inter", 12),
+            fg="#FFFFFF", bg="#101010", activebackground="#101010",
+            selectcolor="#202020", command=self._apply_debug_level
+        )
+        self.debug_chk.grid(row=0, column=6, padx=(0, 16), pady=2, sticky="w")
+
+        # Botones iniciar / parar
         self.run_button = tk.Button(
-            buttons_frame, text="INICIAR",
-            font=("Inter", 14, "bold"), fg="#FFFFFF", bg="#006400",
-            command=self.start_receiving, relief="raised", bd=2, width=12)
-        self.run_button.pack(side="left", padx=8)
+            io_frame, text="INICIAR", font=("Inter", 14, "bold"),
+            fg="#FFFFFF", bg="#006400", command=self.start_receiving, relief="raised", bd=2, width=12
+        )
+        self.run_button.grid(row=0, column=7, padx=8)
 
         self.stop_button = tk.Button(
-            buttons_frame, text="PARAR",
-            font=("Inter", 14, "bold"), fg="#FFFFFF", bg="#CC0000",
-            command=self.stop_receiving, relief="raised", bd=2, width=12, state="disabled")
-        self.stop_button.pack(side="left", padx=8)
-    
-    def setup_bindings(self):
-        self.root.bind("<Escape>", self.close_fullscreen)
-        self.root.bind("<F11>", self.toggle_fullscreen)
-        self.root.bind("<Control-m>", lambda e: self.minimize_window())
+            io_frame, text="PARAR", font=("Inter", 14, "bold"),
+            fg="#FFFFFF", bg="#404040", command=self.stop_receiving,
+            relief="raised", bd=2, width=12, state="disabled"
+        )
+        self.stop_button.grid(row=0, column=8, padx=8)
 
+        # Extra row: open logs
+        tools_frame = tk.Frame(self.root, bg="#101010")
+        tools_frame.grid(row=2, column=0, columnspan=8, sticky="s", pady=(40, 0))
+        open_logs_btn = tk.Button(
+            tools_frame, text="Abrir carpeta logs", font=("Inter", 11),
+            fg="#FFFFFF", bg="#303030", activebackground="#505050",
+            command=self.open_logs_folder
+        )
+        open_logs_btn.pack()
 
-
+    # -------------------- Cuadros de datos --------------------
     def create_data_displays(self):
-        """Crea los cuadros de visualización de datos"""
-        # Frame para datos del acumulador
-        accu_frame = tk.LabelFrame(
-            self.root, text="ACUMULADOR", 
-            font=("Inter", 12, "bold"),
-            fg="#00FF00", bg="#101010", bd=2
-        )
+        # ACUMULADOR
+        accu_frame = tk.LabelFrame(self.root, text="ACUMULADOR",
+                                   font=("Inter", 12, "bold"), fg="#00FF00",
+                                   bg="#101010", bd=2)
         accu_frame.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
-        
-        # Labels para datos del acumulador
-        self.accu_voltage_label = tk.Label(
-            accu_frame, text="DC Bus: -- V", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.accu_voltage_label = tk.Label(accu_frame, text="DC Bus: -- V",
+                                           font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.accu_voltage_label.pack(pady=2)
-        
-        self.accu_current_label = tk.Label(
-            accu_frame, text="Corriente: -- A", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.accu_current_label = tk.Label(accu_frame, text="Corriente: -- A",
+                                           font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.accu_current_label.pack(pady=2)
-        
-        self.accu_power_label = tk.Label(
-            accu_frame, text="Potencia: -- W", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.accu_power_label = tk.Label(accu_frame, text="Potencia: -- W",
+                                         font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.accu_power_label.pack(pady=2)
-        
-        # Frame para temperaturas del acumulador
-        temp_frame = tk.LabelFrame(
-            self.root, text="TEMPERATURAS", 
-            font=("Inter", 12, "bold"),
-            fg="#FFA500", bg="#101010", bd=2
-        )
+
+        # TEMPERATURAS
+        temp_frame = tk.LabelFrame(self.root, text="TEMPERATURAS",
+                                   font=("Inter", 12, "bold"), fg="#FFA500",
+                                   bg="#101010", bd=2)
         temp_frame.grid(row=3, column=2, columnspan=2, padx=5, pady=5, sticky="nsew")
-        
-        # Labels para temperaturas
-        self.temp_accu_label = tk.Label(
-            temp_frame, text="Accu Max: -- °C", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.temp_accu_label = tk.Label(temp_frame, text="Accu Max: -- °C",
+                                        font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.temp_accu_label.pack(pady=2)
-        
-        self.temp_motor_label = tk.Label(
-            temp_frame, text="Motor: -- °C", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.temp_motor_label = tk.Label(temp_frame, text="Motor: -- °C",
+                                         font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.temp_motor_label.pack(pady=2)
-        
-        self.temp_inverter_label = tk.Label(
-            temp_frame, text="Inversor: -- °C", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.temp_inverter_label = tk.Label(temp_frame, text="Inversor: -- °C",
+                                            font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.temp_inverter_label.pack(pady=2)
-        
-        # Frame para estado del inversor
-        inverter_frame = tk.LabelFrame(
-            self.root, text="ESTADO INVERSOR", 
-            font=("Inter", 12, "bold"),
-            fg="#FF6B6B", bg="#101010", bd=2
-        )
+
+        # ESTADO INVERSOR
+        inverter_frame = tk.LabelFrame(self.root, text="ESTADO INVERSOR",
+                                       font=("Inter", 12, "bold"), fg="#FF6B6B",
+                                       bg="#101010", bd=2)
         inverter_frame.grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
-        
-        self.inverter_status_label = tk.Label(
-            inverter_frame, text="Estado: DESCONECTADO", 
-            font=("Inter", 14, "bold"), fg="#FF0000", bg="#101010"
-        )
+
+        self.inverter_status_label = tk.Label(inverter_frame, text="Estado: DESCONECTADO",
+                                              font=("Inter", 14, "bold"), fg="#FF0000", bg="#101010")
         self.inverter_status_label.pack(pady=5)
-        
-        self.inverter_errors_label = tk.Label(
-            inverter_frame, text="Errores: --", 
-            font=("Inter", 12), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.inverter_errors_label = tk.Label(inverter_frame, text="Errores: --",
+                                              font=("Inter", 12), fg="#FFFFFF", bg="#101010")
         self.inverter_errors_label.pack(pady=2)
-        
-        # Frame para torque
-        torque_frame = tk.LabelFrame(
-            self.root, text="TORQUE", 
-            font=("Inter", 12, "bold"),
-            fg="#4ECDC4", bg="#101010", bd=2
-        )
+
+        # TORQUE
+        torque_frame = tk.LabelFrame(self.root, text="TORQUE",
+                                     font=("Inter", 12, "bold"), fg="#4ECDC4",
+                                     bg="#101010", bd=2)
         torque_frame.grid(row=4, column=2, columnspan=2, padx=5, pady=5, sticky="nsew")
-        
-        self.torque_req_label = tk.Label(
-            torque_frame, text="Solicitado: -- Nm", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.torque_req_label = tk.Label(torque_frame, text="Solicitado: -- Nm",
+                                         font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.torque_req_label.pack(pady=2)
-        
-        self.torque_est_label = tk.Label(
-            torque_frame, text="Estimado: -- Nm", 
-            font=("Inter", 14), fg="#FFFFFF", bg="#101010"
-        )
+
+        self.torque_est_label = tk.Label(torque_frame, text="Estimado: -- Nm",
+                                         font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.torque_est_label.pack(pady=2)
-        
-        # Área de log de telemetría
-        log_frame = tk.LabelFrame(
-            self.root, text="LOG DE TELEMETRÍA", 
-            font=("Inter", 12, "bold"),
-            fg="#FFFFFF", bg="#101010", bd=2
-        )
-        log_frame.grid(row=6, column=0, columnspan=6, padx=5, pady=5, sticky="nsew")
-        
+
+        # LOG
+        log_frame = tk.LabelFrame(self.root, text="LOG",
+                                  font=("Inter", 12, "bold"), fg="#FFFFFF",
+                                  bg="#101010", bd=2)
+        log_frame.grid(row=6, column=0, columnspan=8, padx=5, pady=5, sticky="nsew")
+
         self.telemetry_display = st.ScrolledText(
-            log_frame, width=100, height=10, 
-            font=("Consolas", 10), 
+            log_frame, width=100, height=12, font=("Consolas", 10),
             bg="#1a1a1a", fg="#00FF00"
         )
         self.telemetry_display.pack(fill="both", expand=True, padx=5, pady=5)
 
+    # -------------------- Gráficos --------------------
     def create_graphs(self):
-        """Crea los gráficos de acelerador y freno"""
-        # Frame para gráficos
         graphs_frame = tk.Frame(self.root, bg="#101010")
-        graphs_frame.grid(row=5, column=0, columnspan=6, padx=5, pady=5, sticky="nsew")
-        
-        # Configurar matplotlib para tema oscuro
-        plt.style.use('dark_background')
-        
-        # Crear figura para gráficos
-        self.fig = Figure(figsize=(12, 4), facecolor='#101010')
-        
-        # Gráfico de acelerador
+        graphs_frame.grid(row=5, column=0, columnspan=8, padx=5, pady=5, sticky="nsew")
+
+        plt.style.use("dark_background")
+        self.fig = Figure(figsize=(12, 4), facecolor="#101010")
+
         self.ax_throttle = self.fig.add_subplot(121)
-        self.ax_throttle.set_title("ACELERADOR (%)", color='white', fontsize=12, fontweight='bold')
+        self.ax_throttle.set_title("ACELERADOR (%)", color="white", fontsize=12, fontweight="bold")
         self.ax_throttle.set_ylim(0, 100)
-        self.ax_throttle.set_facecolor('#1a1a1a')
+        self.ax_throttle.set_facecolor("#1a1a1a")
         self.ax_throttle.grid(True, alpha=0.3)
-        
-        # Gráfico de freno
+
         self.ax_brake = self.fig.add_subplot(122)
-        self.ax_brake.set_title("FRENO (%)", color='white', fontsize=12, fontweight='bold')
+        self.ax_brake.set_title("FRENO (%)", color="white", fontsize=12, fontweight="bold")
         self.ax_brake.set_ylim(0, 100)
-        self.ax_brake.set_facecolor('#1a1a1a')
+        self.ax_brake.set_facecolor("#1a1a1a")
         self.ax_brake.grid(True, alpha=0.3)
-        
-        # Canvas para mostrar gráficos
+
         self.canvas = FigureCanvasTkAgg(self.fig, master=graphs_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-    def setup_bindings(self):
-        """Configura los eventos de teclado"""
-        self.root.bind("<Escape>", self.close_fullscreen)
-        self.root.bind("<F11>", self.toggle_fullscreen)
+    # -------------------- Statusbar --------------------
+    def create_statusbar(self):
+        sb = tk.Frame(self.root, bg="#151515")
+        sb.grid(row=7, column=0, columnspan=8, sticky="ew")
+        for i in range(8):
+            sb.grid_columnconfigure(i, weight=1)
 
+        self.status_label = tk.Label(
+            sb, textvariable=self.status_var, anchor="w",
+            font=("Inter", 11), fg="#DDDDDD", bg="#151515", padx=8, pady=4
+        )
+        self.status_label.grid(row=0, column=0, columnspan=8, sticky="ew")
+
+    # -------------------- Logging bridge --------------------
+    def setup_logging_bridge(self):
+        """Route backend logger into the UI text area."""
+        self.tk_log_handler = TkTextHandler(self.telemetry_display)
+        formatter = logging.Formatter("%(levelname)s - %(name)s - %(message)s")
+        self.tk_log_handler.setFormatter(formatter)
+
+        self.backend_logger = logging.getLogger("ISC_RTT_USB")
+        self.backend_logger.addHandler(self.tk_log_handler)
+        # initial level from checkbox default
+        self._apply_debug_level()
+
+    def _apply_debug_level(self):
+        self.backend_logger.setLevel(logging.DEBUG if self.debug_var.get() else logging.INFO)
+
+    # -------------------- Acciones de ventana --------------------
+    def minimize_window(self):
+        if self.root.attributes("-fullscreen"):
+            self.root.attributes("-fullscreen", False)
+        self.root.iconify()
+
+    def close_window(self):
+        self.exit_program()
+
+    def close_fullscreen(self, event=None):
+        self.root.attributes("-fullscreen", False)
+
+    def toggle_fullscreen(self, event=None):
+        self.root.attributes("-fullscreen", not self.root.attributes("-fullscreen"))
+
+    # -------------------- Puerto serie helpers --------------------
+    def refresh_ports(self):
+        ports = ISC_RTT.list_serial_ports()
+        self.port_combo["values"] = [dev for dev, _ in ports]
+        if not self.selected_port.get():
+            autodet = self._auto_pick_port_from_list(ports)
+            if autodet:
+                self.selected_port.set(autodet)
+        self.status_var.set(f"Puertos detectados: {', '.join([p[0] for p in ports]) or 'ninguno'}")
+
+    def _auto_pick_port_from_list(self, ports):
+        for dev, desc in ports:
+            d = (desc or "").upper()
+            if "CH340" in d or "USB-SERIAL" in d:
+                return dev
+        return ports[0][0] if ports else ""
+
+    # -------------------- Iniciar / Parar --------------------
     def start_receiving(self):
-        """Inicia la recepción de datos de telemetría"""
         if self.receiving_flag:
             messagebox.showwarning("Aviso", "La recepción ya está en marcha")
             return
-        
+
+        port = self.selected_port.get().strip()
+        if not port:
+            messagebox.showwarning("Puerto", "Selecciona un puerto COM antes de iniciar.")
+            return
+
         try:
-            # Resetear flags
+            baud = int(self.selected_baud.get())
+        except ValueError:
+            messagebox.showerror("Baud", "Baud inválido.")
+            return
+
+        use_influx = bool(self.use_influx_var.get())
+        debug_mode = bool(self.debug_var.get())
+
+        try:
+            # Reset flags
             self.stop_data = False
             ISC_RTT.new_data_flag = 0
             self.receiving_flag = True
-            
-            # Obtener piloto y circuito seleccionados
-            piloto = self.piloto_var.get()
+
+            piloto   = self.piloto_var.get()
             circuito = self.circuito_var.get()
-            
-            # Crear bucket en InfluxDB
-            bucket_id = ISC_RTT.create_bucket(piloto, circuito)
-            
-            # Iniciar thread de recepción de datos
+
+            bucket_id = ISC_RTT.create_bucket(piloto, circuito, use_influx=use_influx)
+
+            # Thread RX (pasamos puerto, baud, influx y debug)
             self.receiving_thread = threading.Thread(
                 target=ISC_RTT.receive_data,
-                args=(bucket_id, piloto, circuito),
+                args=(bucket_id, piloto, circuito, port, baud, use_influx, debug_mode),
                 daemon=True
             )
             self.receiving_thread.start()
-            
-            # Iniciar thread de actualización de UI
-            self.ui_update_thread = threading.Thread(
-                target=self.update_ui_thread,
-                daemon=True
-            )
+
+            # Thread UI updates
+            self.ui_update_thread = threading.Thread(target=self.update_ui_thread, daemon=True)
             self.ui_update_thread.start()
-            
-            # Actualizar estado de botones
+
+            # Botones
             self.run_button.config(state="disabled", bg="#404040")
             self.stop_button.config(state="normal", bg="#CC0000")
-            
-            # Mostrar mensaje en log
-            self.log_message(f"Iniciando telemetría: {piloto} en {circuito}")
-            
+
+            mode = "con Influx" if use_influx else "sin Influx"
+            dbg  = "DEBUG ON" if debug_mode else "DEBUG OFF"
+            msg = f"Iniciando telemetría ({mode}, {dbg}): {piloto} en {circuito} | {port} @ {baud}"
+            self.log_message(msg)
+            self.status_var.set(msg)
+
         except Exception as e:
             messagebox.showerror("Error", f"Error iniciando recepción: {e}")
             self.receiving_flag = False
 
     def stop_receiving(self):
-        """Para la recepción de datos"""
         if not self.receiving_flag:
             return
-        
+
         try:
-            # Establecer flags de parada
             self.stop_data = True
             ISC_RTT.new_data_flag = -1
             self.receiving_flag = False
-            
-            # Esperar a que terminen los threads
+
             if self.receiving_thread and self.receiving_thread.is_alive():
                 self.receiving_thread.join(timeout=2.0)
-            
+
             if self.ui_update_thread and self.ui_update_thread.is_alive():
                 self.ui_update_thread.join(timeout=1.0)
-            
-            # Actualizar estado de botones
+
             self.run_button.config(state="normal", bg="#006400")
             self.stop_button.config(state="disabled", bg="#404040")
-            
+
             self.log_message("Recepción de telemetría detenida")
-            
+            self.status_var.set("Detenido.")
         except Exception as e:
             messagebox.showerror("Error", f"Error deteniendo recepción: {e}")
 
+    # -------------------- Loop de actualización UI --------------------
     def update_ui_thread(self):
-        """Thread para actualizar la UI con nuevos datos"""
         while not self.stop_data:
             try:
                 if ISC_RTT.new_data_flag == 1:
-                    # Obtener los últimos datos
                     latest_data = ISC_RTT.get_latest_data()
-                    
-                    # Programar actualización en el thread principal
                     self.root.after(0, self.update_data_displays, latest_data)
                     self.root.after(0, self.log_message, ISC_RTT.data_str)
-                    
-                    # Resetear flag
                     ISC_RTT.new_data_flag = 0
-                
-                time.sleep(0.01)  # 100 Hz de actualización
-                
+                time.sleep(0.01)
             except Exception as e:
                 self.root.after(0, self.log_message, f"Error actualizando UI: {e}")
                 break
 
+    # -------------------- Render de datos --------------------
     def update_data_displays(self, data: dict):
-        """Actualiza los displays de datos con la información recibida"""
         try:
-            # Actualizar datos del acumulador
-            if '0x640' in data:  # ACCUMULATOR
-                accu_data = data['0x640']
-                if 'current_sensor' in accu_data:
-                    self.accu_current_label.config(text=f"Corriente: {accu_data['current_sensor']:.1f} A")
-                if 'cell_min_v' in accu_data:
-                    self.accu_voltage_label.config(text=f"Voltaje Min: {accu_data['cell_min_v']:.2f} V")
-            
-            if '0x620' in data:  # POWERTRAIN
-                pt_data = data['0x620']
-                if 'dc_bus_voltage' in pt_data:
-                    self.accu_voltage_label.config(text=f"DC Bus: {pt_data['dc_bus_voltage']:.1f} V")
-                if 'dc_bus_power' in pt_data:
-                    self.accu_power_label.config(text=f"Potencia: {pt_data['dc_bus_power']:.1f} W")
-                if 'motor_temp' in pt_data:
-                    self.temp_motor_label.config(text=f"Motor: {pt_data['motor_temp']:.1f} °C")
-                if 'pwrstg_temp' in pt_data:
-                    self.temp_inverter_label.config(text=f"Inversor: {pt_data['pwrstg_temp']:.1f} °C")
-            
-            # Actualizar temperaturas del acumulador
-            if '0x640' in data:
-                accu_data = data['0x640']
-                if 'cell_max_temp' in accu_data:
-                    temp = accu_data['cell_max_temp']
+            # ACCUMULATOR (0x640)
+            if "0x640" in data:
+                accu = data["0x640"]
+                if "current_sensor" in accu:
+                    self.accu_current_label.config(text=f"Corriente: {accu['current_sensor']:.1f} A")
+                if "cell_min_v" in accu:
+                    self.accu_voltage_label.config(text=f"Voltaje Min: {accu['cell_min_v']:.2f} V")
+                if "cell_max_temp" in accu:
+                    temp = float(accu["cell_max_temp"])
                     color = "#FF0000" if temp > 50 else "#FFA500" if temp > 40 else "#FFFFFF"
                     self.temp_accu_label.config(text=f"Accu Max: {temp:.1f} °C", fg=color)
-            
-            # Actualizar estado del inversor
-            if '0x680' in data:  # INVERTER_STATUS
-                inv_data = data['0x680']
-                if 'status' in inv_data:
-                    status = int(inv_data['status'])
+
+            # POWERTRAIN (0x620) – compat rellenada por backend desde 0x600
+            if "0x620" in data:
+                pt = data["0x620"]
+                if "dc_bus_voltage" in pt:
+                    self.accu_voltage_label.config(text=f"DC Bus: {pt['dc_bus_voltage']:.1f} V")
+                if "dc_bus_power" in pt:
+                    self.accu_power_label.config(text=f"Potencia: {pt['dc_bus_power']:.1f} W")
+                if "motor_temp" in pt:
+                    self.temp_motor_label.config(text=f"Motor: {pt['motor_temp']:.1f} °C")
+                if "pwrstg_temp" in pt:
+                    self.temp_inverter_label.config(text=f"Inversor: {pt['pwrstg_temp']:.1f} °C")
+
+            # INVERTER STATUS (0x680)
+            if "0x680" in data:
+                inv = data["0x680"]
+                if "status" in inv:
+                    status = int(inv["status"])
                     status_text = "CONECTADO" if status == 1 else "DESCONECTADO"
                     status_color = "#00FF00" if status == 1 else "#FF0000"
                     self.inverter_status_label.config(text=f"Estado: {status_text}", fg=status_color)
-                
-                if 'errors' in inv_data:
-                    errors = int(inv_data['errors'])
+                if "errors" in inv:
+                    errors = int(inv["errors"])
                     error_color = "#FF0000" if errors > 0 else "#FFFFFF"
                     self.inverter_errors_label.config(text=f"Errores: {errors}", fg=error_color)
-            
-            # Actualizar torque
-            if '0x630' in data:  # DRIVER_INPUTS
-                driver_data = data['0x630']
-                if 'torque_req' in driver_data:
-                    self.torque_req_label.config(text=f"Solicitado: {driver_data['torque_req']:.1f} Nm")
-                if 'torque_est' in driver_data:
-                    self.torque_est_label.config(text=f"Estimado: {driver_data['torque_est']:.1f} Nm")
-                
-                # Actualizar gráficos de pedales
-                if 'throttle' in driver_data and 'brake' in driver_data:
-                    self.update_pedal_graphs(driver_data['throttle'], driver_data['brake'])
-            
+
+            # DRIVER INPUTS (0x630)
+            if "0x630" in data:
+                drv = data["0x630"]
+                if "torque_req" in drv:
+                    self.torque_req_label.config(text=f"Solicitado: {drv['torque_req']:.1f} Nm")
+                if "torque_est" in drv:
+                    self.torque_est_label.config(text=f"Estimado: {drv['torque_est']:.1f} Nm")
+                if "throttle" in drv and "brake" in drv:
+                    self.update_pedal_graphs(drv["throttle"], drv["brake"])
+
         except Exception as e:
             self.log_message(f"Error actualizando displays: {e}")
 
+    # -------------------- Gráficas pedales --------------------
     def update_pedal_graphs(self, throttle: float, brake: float):
-        """Actualiza los gráficos de acelerador y freno"""
         try:
-            current_time = time.time()
-            
-            # Añadir nuevos datos a las colas
-            self.throttle_history.append(throttle)
-            self.brake_history.append(brake)
-            self.time_history.append(current_time)
-            
-            # Limpiar gráficos
+            t_now = time.time()
+            self.throttle_history.append(float(throttle))
+            self.brake_history.append(float(brake))
+            self.time_history.append(t_now)
+
             self.ax_throttle.clear()
             self.ax_brake.clear()
-            
-            # Configurar gráficos
-            self.ax_throttle.set_title("ACELERADOR (%)", color='white', fontsize=12, fontweight='bold')
+
+            self.ax_throttle.set_title("ACELERADOR (%)", color="white", fontsize=12, fontweight="bold")
             self.ax_throttle.set_ylim(0, 100)
-            self.ax_throttle.set_facecolor('#1a1a1a')
+            self.ax_throttle.set_facecolor("#1a1a1a")
             self.ax_throttle.grid(True, alpha=0.3)
-            
-            self.ax_brake.set_title("FRENO (%)", color='white', fontsize=12, fontweight='bold')
+
+            self.ax_brake.set_title("FRENO (%)", color="white", fontsize=12, fontweight="bold")
             self.ax_brake.set_ylim(0, 100)
-            self.ax_brake.set_facecolor('#1a1a1a')
+            self.ax_brake.set_facecolor("#1a1a1a")
             self.ax_brake.grid(True, alpha=0.3)
-            
-            # Plotear datos si hay suficientes
+
             if len(self.throttle_history) > 1:
-                time_range = np.array(self.time_history) - self.time_history[0]
-                
-                self.ax_throttle.plot(time_range, self.throttle_history, 'g-', linewidth=2)
-                self.ax_throttle.fill_between(time_range, 0, self.throttle_history, alpha=0.3, color='green')
-                
-                self.ax_brake.plot(time_range, self.brake_history, 'r-', linewidth=2)
-                self.ax_brake.fill_between(time_range, 0, self.brake_history, alpha=0.3, color='red')
-            
-            # Actualizar canvas
+                t0 = self.time_history[0]
+                ts = np.array(self.time_history) - t0
+                self.ax_throttle.plot(ts, self.throttle_history, "g-", linewidth=2)
+                self.ax_throttle.fill_between(ts, 0, self.throttle_history, alpha=0.3, color="green")
+                self.ax_brake.plot(ts, self.brake_history, "r-", linewidth=2)
+                self.ax_brake.fill_between(ts, 0, self.brake_history, alpha=0.3, color="red")
+
             self.canvas.draw()
-            
         except Exception as e:
             self.log_message(f"Error actualizando gráficos: {e}")
 
-    def log_message(self, message: str):
-        """Añade un mensaje al log de telemetría"""
+    # -------------------- Utilities --------------------
+    def open_logs_folder(self):
+        path = os.path.abspath("logs")
+        os.makedirs(path, exist_ok=True)
         try:
-            timestamp = time.strftime("%H:%M:%S")
-            formatted_message = f"[{timestamp}] {message}"
-            
-            self.telemetry_display.insert(tk.END, formatted_message + "\n")
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            messagebox.showerror("Abrir carpeta", f"No se pudo abrir la carpeta de logs:\n{e}")
+
+    # -------------------- Log y salida --------------------
+    def log_message(self, message: str):
+        try:
+            ts = time.strftime("%H:%M:%S")
+            self.telemetry_display.insert(tk.END, f"[{ts}] {message}\n")
             self.telemetry_display.see(tk.END)
-            
-            # Limitar el número de líneas en el log
-            lines = self.telemetry_display.get("1.0", tk.END).split('\n')
-            if len(lines) > 500:  # Mantener solo las últimas 500 líneas
-                self.telemetry_display.delete("1.0", f"{len(lines)-500}.0")
-                
+            # Limitar a 600 líneas
+            lines = self.telemetry_display.get("1.0", tk.END).split("\n")
+            if len(lines) > 600:
+                self.telemetry_display.delete("1.0", f"{len(lines)-600}.0")
         except Exception as e:
             print(f"Error añadiendo mensaje al log: {e}")
 
-    def close_fullscreen(self, event=None):
-        """Sale del modo pantalla completa"""
-        self.root.attributes('-fullscreen', False)
-
-    def toggle_fullscreen(self, event=None):
-        """Alterna el modo pantalla completa"""
-        is_fullscreen = self.root.attributes('-fullscreen')
-        self.root.attributes('-fullscreen', not is_fullscreen)
-
     def exit_program(self):
-        """Cierra el programa de forma segura"""
         try:
-            # Parar recepción si está activa
             if self.receiving_flag:
                 self.stop_receiving()
-            
-            # Cerrar ventana
             self.root.quit()
             self.root.destroy()
             sys.exit(0)
-            
         except Exception as e:
             print(f"Error cerrando programa: {e}")
             sys.exit(1)
 
     def run(self):
-        """Inicia la aplicación"""
         try:
             self.root.mainloop()
         except KeyboardInterrupt:
             self.exit_program()
 
-# Punto de entrada principal
+
+# -------------------- Main --------------------
 if __name__ == "__main__":
-    print("=== Iniciando ISC Real-Time Telemetry UI ===")
-    
+    print("=== Iniciando ISCmetrics UI ===")
     try:
         app = TelemetryUI()
         app.run()
