@@ -108,7 +108,7 @@ volatile uint32_t tel_sent_fail = 0;   // nRF24 TX failures
 
 // ---------- MODOS DEBUG ----------
 #define DEBUG 1
-#define CALIBRATION 1
+#define CALIBRATION 0
 
 // ---------- FILTROS LECTURA PEDAL ACELERADOR --------
 uint32_t lecturas_s1[N_LECTURAS] = {0};
