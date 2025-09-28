@@ -94,14 +94,11 @@ static void MX_SPI1_Init(void);
 
 // ---------- TEL Testing ----------
 #define TEL_USE_DUMMY   0   // set 1 to test without CAN, 0 for real can data
-#define DEGUB 1 //Para todos los debuggers
+#define DEGUB 0 //Para todos los debuggers
 #define TEL_CHAN        76
 static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
 
 static uint32_t tel_tick = 0;  // ms accumulator to 500
-// forward decls
-static void tel_build_packet(float f[8]);
-static void tel_send_now(void);
 
 /* ---- Telemetry debug counters ---- */
 volatile uint32_t tel_irq_cnt   = 0;   // increments each TIM16 ISR
@@ -111,7 +108,7 @@ volatile uint32_t tel_sent_fail = 0;   // nRF24 TX failures
 
 // ---------- MODOS DEBUG ----------
 #define DEBUG 1
-#define CALIBRATION 0
+#define CALIBRATION 1
 
 // ---------- FILTROS LECTURA PEDAL ACELERADOR --------
 uint32_t lecturas_s1[N_LECTURAS] = {0};
@@ -130,6 +127,31 @@ typedef struct __attribute__((packed)) {
     float    v6;
     float    v7;
 } TelFrame;  // 2+2 + 7*4 = 32 bytes
+
+// forward decls
+static void tel_build_packet(TelFrame *p);
+static void tel_send_now(void);
+/* --- Telemetry / diag helpers (prototypes) --- */
+static void     gpio_dump_once(void);
+static void     nrf24_diag_once(void);
+static uint8_t  nrf24_write_readback(uint8_t reg, uint8_t val);
+static void     nrf24_tx_smoke_once(void);
+static void print_early(const char *s);
+static void dump_reset_cause(void);
+static void heartbeat_pin_init(void);
+static void heartbeat_tick(void);
+static uint8_t nrf24_tx32(const void *buf32);
+static void nrf24_flush_tx(void);
+
+
+
+#ifndef W_TX_PAYLOAD
+#define W_TX_PAYLOAD  0xA0
+#endif
+#ifndef FLUSH_TX
+#define FLUSH_TX      0xE1
+#endif
+
 
 //RADIO ID
 enum {
@@ -183,6 +205,8 @@ int inv_t_motor;			// Lectura de motor temperature
 int inv_t_igbt;				// Lectura de power stage temperature
 int inv_t_air;				// Lectura de air temperature
 int inv_n_actual;			// Lectura de speed actual value
+int inv_i_actual = 0;        // Lectura de corriente actual del inversor
+
 
 // Sensores
 uint16_t buffer_adc[3]; // Buffer para DMA
@@ -288,8 +312,13 @@ int main(void)
   MX_FATFS_Init();
   MX_FDCAN3_Init();
   MX_SPI1_Init();
+
+
   /* USER CODE BEGIN 2 */
 	// Inicializar tarjeta microSD
+  print_early("\r\n=== BOOT ===\r\n");
+  dump_reset_cause();
+  heartbeat_pin_init();
 	//SDCard_start();
 	//HAL_Delay(2000)
   /* USER CODE BEGIN 2 */
@@ -299,6 +328,14 @@ int main(void)
   HAL_GPIO_WritePin(NRF24_CE_PORT,  NRF24_CE_PIN,  GPIO_PIN_RESET); // CE low
   HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET);   // CSN high
   HAL_Delay(1);
+
+
+  //CHECK de float formatting
+  char t[80];
+  int n = snprintf(t, sizeof t, "[SMOKE] %.2f %.2f %.2f\r\n", 0.0f, 1.23f, 456.0f);
+  HAL_UART_Transmit(&huart2, (uint8_t*)t, n, 100);
+
+  setvbuf(stdout, NULL, _IONBF, 0);
 
 
 
@@ -322,7 +359,15 @@ int main(void)
   HAL_UART_Transmit(&huart2,(uint8_t*)m,strlen(m),HAL_MAX_DELAY);
   NRF24_Init();
   NRF24_TxMode(rf_addr, TEL_CHAN);
+  nrf24_WriteReg(DYNPD, 0x00);        // all pipes DPL off
+  nrf24_WriteReg(FEATURE, 0x00);      // disable DPL/ACK pay/NoAck
+  nrf24_WriteReg(RX_PW_P0, 32);       // fixed 32 bytes on pipe 0
   NRF24_Dump();
+  // After NRF24_Init(); NRF24_TxMode(...); NRF24_Dump();
+  uint8_t rd = nrf24_write_readback(RF_CH, TEL_CHAN);
+  (void)rd;// expect same
+  rd = nrf24_write_readback(EN_AA, 0x00);                 // AutoAck OFF expected
+  rd = nrf24_write_readback(SETUP_RETR, 0x00);            // no auto-retry
   uint8_t cfg = nrf24_ReadReg(CONFIG);
   uint8_t rf  = nrf24_ReadReg(RF_SETUP);
   uint8_t ch  = nrf24_ReadReg(RF_CH);
@@ -472,6 +517,7 @@ for (int i = 0; i < 10; ++i) {
 		    if (HAL_GetTick() - last >= 500) {
 		        last = HAL_GetTick();
 		        tel_send_now();   // sends one 32-byte frame
+
 		    }
 		if (config_inv_lectura_v == 1)
 		{
@@ -571,7 +617,7 @@ for (int i = 0; i < 10; ++i) {
 	//HAL_TIM_Base_Start_IT(&htim16);
 #endif
 
-#if 1
+#if !CALIBRATION
 	// Espera a que se pulse el botón de arranque mientras se pisa el freno
 	while (boton_arranque == 0)
 	{
@@ -630,6 +676,8 @@ for (int i = 0; i < 10; ++i) {
 	print("RTDS apagado");
 #endif
 
+#if !CALIBRATION
+
 	// Estado STAND BY inversor
 	while (state != 3)
 	{
@@ -670,6 +718,7 @@ for (int i = 0; i < 10; ++i) {
 		HAL_Delay(10);
 
 	}
+#endif
 
 #if DEBUG
 	print("state: ready");
@@ -696,14 +745,15 @@ for (int i = 0; i < 10; ++i) {
 		static uint32_t last_irq_seen = 0;
 		if (HAL_GetTick() - last_1s >= 1000) {
 		    last_1s = HAL_GetTick();
-		    char hb[96];
-		    snprintf(hb, sizeof(hb),
-		             "[TEL] irq=%lu sent=%lu fail=%lu%s  Vdc=%d  rpm=%d  state=%u\r\n",
-		             (unsigned long)tel_irq_cnt,
-		             (unsigned long)tel_sent_ok,
-		             (unsigned long)tel_sent_fail,
-		             (tel_irq_cnt == last_irq_seen) ? " (NO NEW IRQ!)" : "",
-		             inv_dc_bus_voltage, e_machine_rpm, state);
+		    char hb[180];
+		           snprintf(hb, sizeof(hb), // @suppress("Float formatting support")
+		                    "[HB] irq=%lu sent=%lu fail=%lu%s  Vdc=%d rpm=%d state=%u vCellMin=%.0f\r\n",
+		                    (unsigned long)tel_irq_cnt,
+		                    (unsigned long)tel_sent_ok,
+		                    (unsigned long)tel_sent_fail,
+		                    (tel_irq_cnt == last_irq_seen) ? " (NO NEW IRQ!)" : "",
+		                    inv_dc_bus_voltage, e_machine_rpm, state, v_celda_min);
+
 		    HAL_UART_Transmit(&huart2, (uint8_t*)hb, strlen(hb), HAL_MAX_DELAY);
 		    last_irq_seen = tel_irq_cnt;
 
@@ -713,6 +763,60 @@ for (int i = 0; i < 10; ++i) {
 		        tel_tick = 0;          // consume the tick
 		        tel_send_now();        // SPI + UART OK here (foreground)
 		    }
+        // (A) Core counters + a few key signals
+        char hb[180];
+        snprintf(hb, sizeof(hb), // @suppress("Float formatting support")
+                 "[HB] irq=%lu sent=%lu fail=%lu%s  Vdc=%d rpm=%d state=%u vCellMin=%.0f\r\n",
+                 (unsigned long)tel_irq_cnt,
+                 (unsigned long)tel_sent_ok,
+                 (unsigned long)tel_sent_fail,
+                 (tel_irq_cnt == last_irq_seen) ? " (NO NEW IRQ!)" : "",
+                 inv_dc_bus_voltage, e_machine_rpm, state, v_celda_min);
+        HAL_UART_Transmit(&huart2, (uint8_t*)hb, strlen(hb), HAL_MAX_DELAY);
+        last_irq_seen = tel_irq_cnt;
+
+        // (B) Quick GPIO view of the radio pins (power/wiring sanity)
+        gpio_dump_once();
+
+        // (C) nRF24 register snapshot
+        nrf24_diag_once();
+
+        // (D) CAN liveness on all three buses
+        FDCAN_ProtocolStatusTypeDef ps1, ps2, ps3;
+        HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps1);
+        HAL_FDCAN_GetProtocolStatus(&hfdcan2, &ps2);
+        HAL_FDCAN_GetProtocolStatus(&hfdcan3, &ps3);
+        char cb[160];
+        snprintf(cb, sizeof(cb),
+            "[CAN] INV:LEC=%lu BOFF=%lu | ACU:LEC=%lu BOFF=%lu | DASH:LEC=%lu BOFF=%lu\r\n",
+            (unsigned long)ps1.LastErrorCode, (unsigned long)ps1.BusOff,
+            (unsigned long)ps2.LastErrorCode, (unsigned long)ps2.BusOff,
+            (unsigned long)ps3.LastErrorCode, (unsigned long)ps3.BusOff);
+        HAL_UART_Transmit(&huart2, (uint8_t*)cb, strlen(cb), HAL_MAX_DELAY);
+
+        // (E) Peek the next telemetry payload (format sanity)
+        TelFrame peek;
+        tel_build_packet(&peek);
+        char txl[220];
+        int n = snprintf(txl, sizeof(txl),
+            "[TEL] next ID=0x%X seq=%u v1=%.1f v2=%.1f v3=%.1f v4=%.1f v5=%.1f v6=%.1f v7=%.1f\r\n",
+            peek.id, peek.seq, peek.v1, peek.v2, peek.v3, peek.v4, peek.v5, peek.v6, peek.v7);
+        if (n > 0) HAL_UART_Transmit(&huart2, (uint8_t*)txl, (uint16_t)n, HAL_MAX_DELAY);
+
+        // (F) Self-heal if radio settings look off (brownout recovery)
+        uint8_t cfg_now = nrf24_ReadReg(CONFIG);
+        uint8_t ch_now  = nrf24_ReadReg(RF_CH);
+        if ( ((cfg_now & 0x0A) != 0x0A) || (ch_now != TEL_CHAN) ) {
+            const char *rx = "[NRF] Reinit (PWR_UP/EN_CRC/CH)\r\n";
+            HAL_UART_Transmit(&huart2, (uint8_t*)rx, strlen(rx), HAL_MAX_DELAY);
+            NRF24_Init();
+            NRF24_TxMode(rf_addr, TEL_CHAN);
+        }
+
+#if DEBUG
+        // (G) One TX smoke test (independent of your normal telemetry)
+        //nrf24_tx_smoke_once();
+#endif
 
     /* USER CODE END WHILE */
 
@@ -1988,7 +2092,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 
 		TxData_Acu[0] = precharge_button;
-		printValue(TxData_Acu[0]);
+		//printValue(TxData_Acu[0]);
 
 		if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu) == HAL_OK)
 		{
@@ -2221,113 +2325,61 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 // Packs 8 floats (32 bytes). f[0] is the "frame ID".
 static void tel_build_packet(TelFrame *p)
 {
-    static uint16_t seq = 0;
-
-#if TEL_USE_DUMMY
-    static const uint16_t ids[] = { TEL_ACCUM, TEL_INVERTER, TEL_DRIVER, TEL_INV_TEMPS };
-    static uint8_t idx = 0;
-    if (++idx >= (sizeof(ids)/sizeof(ids[0]))) idx = 0;
-    p->id  = ids[idx];
-    p->seq = seq++;
-
-    switch (p->id) {
-    case TEL_ACCUM:
-        p->v1 = (float)inv_dc_bus_voltage;  // V
-        p->v2 = (float)inv_dc_bus_power;    // W (if used)
-        p->v3 = (float)v_celda_min;         // mV (3600.00 you saw)
-        p->v4 = 0; p->v5 = 0; p->v6 = 0; p->v7 = 0;
-        break;
-
-    case TEL_INVERTER:
-        p->v1 = (float)state;
-        p->v2 = (float)e_machine_rpm;
-        p->v3 = 0; p->v4 = 0; p->v5 = 0; p->v6 = 0; p->v7 = 0;
-        break;
-
-    case TEL_DRIVER:
-        p->v1 = (float)s1_aceleracion;
-        p->v2 = (float)s2_aceleracion;
-        p->v3 = (float)s_freno;
-        p->v4 = (float)torque_total;
-        p->v5 = 0; p->v6 = 0; p->v7 = 0;
-        break;
-
-    case TEL_INV_TEMPS:
-        p->v1 = (float)inv_t_motor;
-        p->v2 = (float)inv_t_igbt;
-        p->v3 = (float)inv_t_air;
-        p->v4 = (float)inv_n_actual;   // if you later fill these
-        p->v5 = (float)I_ACTUAL;       // (or use inv_i_actual variable)
-        p->v6 = 0; p->v7 = 0;
-        break;
-    }
-#else
-    // Pick a *fixed* topic per tick cadence – start with ACCUM (simple & useful)
-    p->id  = TEL_ACCUM;
-    p->seq = seq++;
-
-    p->v1 = (float)inv_dc_bus_voltage;
-    p->v2 = (float)inv_dc_bus_power;   // 0 if unused
-    p->v3 = (float)v_celda_min;
-    p->v4 = (float)e_machine_rpm;
-    p->v5 = (float)torque_total;
-    p->v6 = (float)s1_aceleracion;
-    p->v7 = (float)s2_aceleracion;
-#endif
-{
     static uint16_t seq   = 0;
     static uint8_t  which = 0;  // 0:0x600, 1:0x610, 2:0x620, 3:0x630
 
     p->seq = seq++;
 
 #if TEL_USE_DUMMY
-    // ---------- DUMMY DATA (fabricated but consistent layout) ----------
-    // simple changing counters so the receiver/UI visibly updates
-    static float f = 0.0f; f += 1.0f; if (f > 9999.0f) f = 0.0f;
+    // ---------- DUMMY DATA ----------
+    static float f = 0.0f;
+    f += 1.0f;
+    if (f > 9999.0f) f = 0.0f;
 
     switch (which) {
     default:
     case 0: // 0x600 Powertrain basic
         p->id = 0x600;
-        p->v1 = 350.0f + ((int)f % 50);     // inv_dc_bus_voltage
-        p->v2 = 1000.0f + 10.0f*((int)f);   // e_machine_rpm
-        p->v3 = (float)((int)f % 100);      // torque_total
-        p->v4 = 3600.0f;                    // v_celda_min
-        p->v5 = (float)((int)f % 7);        // state
+        p->v1 = 350.0f + ((int)f % 50);       // inv_dc_bus_voltage
+        p->v2 = 1000.0f + 10.0f*((int)f);     // e_machine_rpm
+        p->v3 = (float)((int)f % 100);        // torque_total
+        p->v4 = 3600.0f;                      // v_celda_min
+        p->v5 = (float)((int)f % 7);          // state
         p->v6 = 0.0f;
         p->v7 = 0.0f;
         break;
 
     case 1: // 0x610 Inverter temps & currents
         p->id = 0x610;
-        p->v1 = 40.0f + ((int)f % 20);      // inv_t_motor
-        p->v2 = 35.0f + ((int)f % 20);      // inv_t_igbt
-        p->v3 = 25.0f + ((int)f % 10);      // inv_t_air
-        p->v4 = 2000.0f + 5.0f*((int)f);    // inv_n_actual
-        p->v5 = 5.0f + 0.1f*((int)f);       // inv_i_actual
-        p->v6 = 0.0f; p->v7 = 0.0f;
+        p->v1 = 40.0f + ((int)f % 20);        // inv_t_motor
+        p->v2 = 35.0f + ((int)f % 20);        // inv_t_igbt
+        p->v3 = 25.0f + ((int)f % 10);        // inv_t_air
+        p->v4 = 2000.0f + 5.0f*((int)f);      // inv_n_actual
+        p->v5 = 5.0f + 0.1f*((int)f);         // inv_i_actual
+        p->v6 = 0.0f;
+        p->v7 = 0.0f;
         break;
 
     case 2: // 0x620 Driver inputs
         p->id = 0x620;
-        p->v1 = (float)((int)f % 4096);     // s1_aceleracion
-        p->v2 = (float)((int)f % 4096);     // s2_aceleracion
+        p->v1 = (float)((int)f % 4096);       // s1_aceleracion
+        p->v2 = (float)((int)f % 4096);       // s2_aceleracion
         p->v3 = (float)(((int)f % 2) ? 1500 : 500); // s_freno
-        p->v4 = (float)(((int)f / 8) % 2);  // precharge_button
-        p->v5 = (float)(((int)f / 16) % 2); // start_button_act
-        p->v6 = (float)(((int)f / 32) % 2); // dash_input_1
-        p->v7 = (float)(((int)f / 64) % 2); // dash_input_2
+        p->v4 = (float)(((int)f / 8) % 2);    // precharge_button
+        p->v5 = (float)(((int)f / 16) % 2);   // start_button_act
+        p->v6 = (float)(((int)f / 32) % 2);   // dash_input_1
+        p->v7 = (float)(((int)f / 64) % 2);   // dash_input_2
         break;
 
     case 3: // 0x630 Accumulator/HV summary
         p->id = 0x630;
-        p->v1 = 350.0f + ((int)f % 50);     // inv_dc_bus_voltage (echo)
+        p->v1 = 350.0f + ((int)f % 50);       // inv_dc_bus_voltage
         p->v2 = 0.0f; p->v3 = 0.0f; p->v4 = 0.0f;
         p->v5 = 0.0f; p->v6 = 0.0f; p->v7 = 0.0f;
         break;
     }
 #else
-    // ---------- REAL DATA (from your CAN-parsed globals) ----------
+    // ---------- REAL DATA ----------
     switch (which) {
     default:
     case 0: // 0x600 Powertrain basic
@@ -2337,7 +2389,8 @@ static void tel_build_packet(TelFrame *p)
         p->v3 = (float)torque_total;
         p->v4 = (float)v_celda_min;
         p->v5 = (float)state;
-        p->v6 = 0.0f; p->v7 = 0.0f;
+        p->v6 = 0.0f;
+        p->v7 = 0.0f;
         break;
 
     case 1: // 0x610 Inverter temps & currents
@@ -2347,7 +2400,8 @@ static void tel_build_packet(TelFrame *p)
         p->v3 = (float)inv_t_air;
         p->v4 = (float)inv_n_actual;
         p->v5 = (float)inv_i_actual;
-        p->v6 = 0.0f; p->v7 = 0.0f;
+        p->v6 = 0.0f;
+        p->v7 = 0.0f;
         break;
 
     case 2: // 0x620 Driver inputs
@@ -2357,29 +2411,21 @@ static void tel_build_packet(TelFrame *p)
         p->v3 = (float)s_freno;
         p->v4 = (float)precharge_button;
         p->v5 = (float)start_button_act;
-        /* --- Optional dashboard inputs (compile-safe) --- */
-        /* If you have real pins, define these in a header (e.g., VCU_pins.h):
-           #define DINPUT1_GPIO_Port   GPIOX
-           #define DINPUT1_Pin         GPIO_PIN_Y
-           #define DINPUT2_GPIO_Port   GPIOX
-           #define DINPUT2_Pin         GPIO_PIN_Z
-        */
         #ifdef DINPUT1_GPIO_Port
             p->v6 = (float)HAL_GPIO_ReadPin(DINPUT1_GPIO_Port, DINPUT1_Pin);
         #else
-            p->v6 = 0.0f;   // no pin defined → safe default
+            p->v6 = 0.0f;
         #endif
-
         #ifdef DINPUT2_GPIO_Port
             p->v7 = (float)HAL_GPIO_ReadPin(DINPUT2_GPIO_Port, DINPUT2_Pin);
         #else
-            p->v7 = 0.0f;   // no pin defined → safe default
+            p->v7 = 0.0f;
         #endif
         break;
 
-    case 3: // 0x630 Accumulator/HV summary (extend later with AMS)
+    case 3: // 0x630 Accumulator/HV summary
         p->id = 0x630;
-        p->v1 = (float)inv_dc_bus_voltage;  // placeholder
+        p->v1 = (float)inv_dc_bus_voltage;
         p->v2 = 0.0f; p->v3 = 0.0f; p->v4 = 0.0f;
         p->v5 = 0.0f; p->v6 = 0.0f; p->v7 = 0.0f;
         break;
@@ -2388,6 +2434,7 @@ static void tel_build_packet(TelFrame *p)
 
     if (++which > 3) which = 0;
 }
+
 
 
 static void tel_send_now(void)
@@ -2404,7 +2451,7 @@ static void tel_send_now(void)
 #endif
 
     // Raw 32-byte TX (nRF24 payload)
-    uint8_t ok = NRF24_Transmit((uint8_t*)&pkt);
+    uint8_t ok = nrf24_tx32(&pkt);
 
 #if DEBUG
     uint8_t st = nrf24_ReadReg(STATUS);
@@ -2417,6 +2464,150 @@ static void tel_send_now(void)
 
     if (ok) tel_sent_ok++; else tel_sent_fail++;
 }
+
+
+//----- Debugging Telemetry con LVB
+static void gpio_dump_once(void) {
+    // Read CE/CSN/IRQ pins to detect wiring/power issues
+    int ce  = HAL_GPIO_ReadPin(NRF24_CE_PORT,  NRF24_CE_PIN);
+    int csn = HAL_GPIO_ReadPin(NRF24_CSN_PORT, NRF24_CSN_PIN);
+#ifdef NRF24_IRQ_PORT
+    int irq = HAL_GPIO_ReadPin(NRF24_IRQ_PORT, NRF24_IRQ_PIN);
+#else
+    int irq = -1; // not wired
+#endif
+    char b[96];
+    snprintf(b,sizeof(b),"[GPIO] CE=%d CSN=%d IRQ=%d\r\n", ce, csn, irq);
+    HAL_UART_Transmit(&huart2,(uint8_t*)b,strlen(b),HAL_MAX_DELAY);
+}
+
+static void nrf24_diag_once(void) {
+    uint8_t status = nrf24_ReadReg(STATUS);
+    uint8_t cfg    = nrf24_ReadReg(CONFIG);
+    uint8_t rf     = nrf24_ReadReg(RF_SETUP);
+    uint8_t ch     = nrf24_ReadReg(RF_CH);
+    uint8_t fifo   = nrf24_ReadReg(FIFO_STATUS);
+    uint8_t obs    = nrf24_ReadReg(OBSERVE_TX);
+    char b[128];
+    snprintf(b,sizeof(b),
+        "[NRF] ST=%02X CFG=%02X RF=%02X CH=%u FIFO=%02X OBS=%02X\r\n",
+        status,cfg,rf,ch,fifo,obs);
+    HAL_UART_Transmit(&huart2,(uint8_t*)b,strlen(b),HAL_MAX_DELAY);
+}
+
+static uint8_t nrf24_write_readback(uint8_t reg, uint8_t val) {
+    nrf24_WriteReg(reg, val);
+    uint8_t rd = nrf24_ReadReg(reg);
+    char b[64];
+    snprintf(b,sizeof(b),"[NRF] WR/RD reg %02X -> %02X/%02X\r\n", reg, val, rd);
+    HAL_UART_Transmit(&huart2,(uint8_t*)b,strlen(b),HAL_MAX_DELAY);
+    return rd;
+}
+
+static void nrf24_tx_smoke_once(void) {
+    // Send 32B known pattern and report TX_DS/STATUS changes
+    uint8_t payload[32] = {0};
+    for (int i=0;i<32;i++) payload[i] = (uint8_t)(0xA0 + i);
+    uint8_t ok = NRF24_Transmit(payload);
+
+    uint8_t st = nrf24_ReadReg(STATUS);
+    uint8_t fi = nrf24_ReadReg(FIFO_STATUS);
+
+    char b[96];
+    snprintf(b,sizeof(b),"[NRF] TX test: %s  STATUS=%02X FIFO=%02X\r\n",
+             ok ? "OK" : "FAIL", st, fi);
+    HAL_UART_Transmit(&huart2,(uint8_t*)b,strlen(b),HAL_MAX_DELAY);
+}
+
+static void print_early(const char *s) {
+    // Safe, blocking TX on USART2 if already init'd; otherwise no-op
+    if (huart2.Instance) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)s, strlen(s), 100);
+    }
+}
+
+static void dump_reset_cause(void) {
+    uint32_t csr = __HAL_RCC_GET_FLAG(RCC_FLAG_PINRST)   ? 1u<<0 : 0;
+    csr |= __HAL_RCC_GET_FLAG(RCC_FLAG_BORRST)  ? 1u<<1 : 0;
+    csr |= __HAL_RCC_GET_FLAG(RCC_FLAG_PORRST)  ? 1u<<2 : 0;
+    csr |= __HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST)  ? 1u<<3 : 0;
+
+    char msg[96];
+    snprintf(msg, sizeof msg, "[RST] flags: PIN=%d BOR=%d POR=%d SFT=%d IWDG=%d WWDG=%d LPWR=%d\r\n",
+        !!(csr&(1u<<0)), !!(csr&(1u<<1)), !!(csr&(1u<<2)),
+        !!(csr&(1u<<3)), !!(csr&(1u<<4)), !!(csr&(1u<<5)), !!(csr&(1u<<6)));
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+}
+
+static void heartbeat_pin_init(void) {
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_13;               // pick a free LED/pin you can probe
+    g.Mode = GPIO_MODE_OUTPUT_PP;
+    g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &g);
+}
+static void heartbeat_tick(void) {
+    static uint32_t last=0;
+    if (HAL_GetTick() - last >= 100) { // 10 Hz blink
+        last = HAL_GetTick();
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    }
+}
+
+// Local FLUSH_TX (no dependency on external driver symbol)
+static void nrf24_flush_tx(void)
+{
+    CSN_LOW();
+    uint8_t cmd = 0xE1; // FLUSH_TX
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    CSN_HIGH();
+}
+
+
+// Write a 32B payload and transmit, waiting for TX_DS or MAX_RT
+static uint8_t nrf24_tx32(const void *buf32)
+{
+    // Clear IRQs: RX_DR | TX_DS | MAX_RT
+    nrf24_WriteReg(STATUS, (1u<<6)|(1u<<5)|(1u<<4));
+
+    // Load payload
+    CSN_LOW();
+    uint8_t cmd = 0xA0; // W_TX_PAYLOAD
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    HAL_SPI_Transmit(&hspi1, (uint8_t*)buf32, 32, 100);
+    CSN_HIGH();
+
+    // Pulse CE to start the transmit. Spec says >10 µs; 1 ms is fine here.
+    HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_RESET);
+
+    // Wait up to ~5 ms for completion
+    uint32_t t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < 5) {
+        uint8_t st = nrf24_ReadReg(STATUS);
+
+        if (st & (1u<<5)) {                 // TX_DS set
+            nrf24_WriteReg(STATUS, (1u<<5));
+            return 1;
+        }
+        if (st & (1u<<4)) {                 // MAX_RT set
+            nrf24_WriteReg(STATUS, (1u<<4));
+            nrf24_flush_tx();               // use our local flush
+            return 0;
+        }
+    }
+
+    // Timeout — clean up
+    nrf24_flush_tx();
+    return 0;
+}
+
+
 
 /*
 void SDCard_start(void)

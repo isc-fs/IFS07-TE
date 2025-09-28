@@ -1,19 +1,25 @@
 # ISC_RTT_serial.py
 """
 Recepción por USB-Serial desde RF-NANO (forward de NRF24L01, 32B LE)
-Mantiene API esperada por tu UI:
+
+Mantiene la API esperada por tu UI:
   - new_data_flag, data_str, latest_data_dict
   - create_bucket(piloto, circuito, use_influx=False) -> bucket_id
   - receive_data(bucket_id, piloto, circuito, port=None, baud=115200, use_influx=False, debug=False)
   - get_latest_data(data_id=None)
   - list_serial_ports()
 
-Además:
-  - Log a Excel en carpeta ./logs por sesión (una fila por frame)
-  - Decodifica payload nuevo (TelFrame: <HHfffffff>, 32B) y legacy (8 floats)
-  - Imprime mensajes estilo Arduino: [CONFIG] y "Radio Checking" periódicos
+ROBUSTEZ:
+  - Framing estricto: SOF1(0xAA) SOF2(0x55) LEN(32) PAYLOAD(32B) XOR(payload)
+  - Re-sync si falta SOF y contadores de errores
+  - Comprobación de longitud/timeout y checksum XOR
+  - Detección de patrón TEST (A0..BF y rampas consecutivas) ⇒ ignora
+  - Chequeo monotónico de SEQ (uint16) y badge LIVE/STALE/BAD exportado a la UI:
+      latest_data_dict["__STATUS__"] = {"badge": "...", "reason": "...", "ts": epoch_ms}
+  - Excel por sesión en ./logs (una fila por frame válido no-TEST)
 """
 
+from __future__ import annotations
 import os
 import time
 import struct
@@ -26,7 +32,7 @@ import serial.tools.list_ports
 # Excel logging
 import pandas as pd
 
-# ================== CONFIG RF (esperada, para debug/log) ==================
+# ================== CONFIG RF (informativo, para log) ==================
 RF_EXPECTED = {
     "PIPE_ADDR": "0xE7E7E7E7E7",
     "CHANNEL":   76,          # 0x4C
@@ -51,12 +57,11 @@ _influx_ok = False
 def _init_influx():
     """Inicializa el cliente de Influx de forma perezosa."""
     global _client, _influx_ok
-    if _client is not None:  # ya intentado
+    if _client is not None:
         return
     try:
-        from influxdb_client import InfluxDBClient  # import dentro para no fallar si lib no está
+        from influxdb_client import InfluxDBClient  # import tardío
         _client = InfluxDBClient(**INFLUX_CONFIG)
-        # No prueba conexión todavía; se considera OK hasta que un write falle
         _influx_ok = True
         logging.getLogger("ISC_RTT_USB").info("InfluxDB inicializado: %s", INFLUX_CONFIG["url"])
     except Exception as e:
@@ -85,7 +90,17 @@ DEFAULT_PORT = None  # autodetect si None
 # ================== ESTADO PARA LA UI ==================
 data_str = ""
 new_data_flag = 0
-latest_data_dict = {}
+latest_data_dict: dict = {}
+
+# Estado de enlace / badges para UI
+_status = {
+    "badge": "STALE",         # LIVE | STALE | BAD
+    "reason": "inicio",
+    "ts": 0,                  # epoch ms del último cambio
+}
+_last_seq = None              # último SEQ visto (uint16)
+_last_seq_advance_ts = 0.0    # time.time() del último avance de SEQ
+_STALE_T = 0.20               # s sin avance de SEQ -> STALE
 
 logger = logging.getLogger("ISC_RTT_USB")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -106,7 +121,7 @@ def _auto_detect_port():
     for p in ports:
         desc = (p.description or "").upper()
         hwid = (p.hwid or "").upper()
-        if "CH340" in desc or "USB-SERIAL" in desc or "CH340" in hwid:
+        if "CH340" in desc or "USB-SERIAL" in desc or "CP210" in desc or "CH340" in hwid or "CP210" in hwid:
             return p.device
     return ports[0].device if ports else None
 
@@ -117,31 +132,68 @@ def _open_serial(port, baud):
     ser.reset_input_buffer()
     return ser
 
+def _set_badge(badge: str, reason: str):
+    """Actualiza badge de estado y lo exporta para la UI."""
+    global _status
+    _status = {
+        "badge": badge,
+        "reason": reason,
+        "ts": int(time.time() * 1000),
+    }
+    latest_data_dict["__STATUS__"] = _status
+
+def _mod16_diff(curr: int, prev: int) -> int:
+    """Diferencia forward en contador uint16 (0..65535)."""
+    return (curr - prev) & 0xFFFF
+
+TEST_PATTERN = bytes(range(0xA0, 0xA0 + PAYLOAD_LEN))  # A0..BF
+
+def _is_consecutive_ramp(payload: bytes) -> bool:
+    """True si payload[i] == payload[i-1] + 1 (mod 256) para toda la trama."""
+    if len(payload) != PAYLOAD_LEN:
+        return False
+    return all(((payload[i] - payload[i-1]) & 0xFF) == 1 for i in range(1, PAYLOAD_LEN))
+
+def is_test_payload(payload: bytes) -> bool:
+    """
+    Considera TEST si es exactamente A0..BF o si es una rampa consecutiva.
+    """
+    return payload == TEST_PATTERN or _is_consecutive_ramp(payload)
+
 def _read_frame(ser, counters=None):
     """
     Frame: SOF1(0xAA) SOF2(0x55) LEN(32) PAYLOAD(32B) XOR(payload)
     Devuelve (payload, err) donde:
       - payload: bytes (32) o None
       - err: None | 'timeout' | 'len' | 'short' | 'chk'
+    Re-sync simple: consume hasta ver AA 55.
     """
-    # Buscar AA 55
+    # Escanear hasta AA
     b = ser.read(1)
     if not b:
         if counters is not None: counters["timeout"] += 1
         return None, "timeout"
     if b[0] != SOF1:
-        # seguimos escaneando sin contar como error
-        return None, None
+        return None, None  # seguir escaneando
+
+    # Esperar 55
     b2 = ser.read(1)
     if not b2:
         if counters is not None: counters["timeout"] += 1
         return None, "timeout"
     if b2[0] != SOF2:
-        return None, None
+        return None, None  # desalineado, volver a escanear
 
+    # LEN
     ln = ser.read(1)
-    if not ln or ln[0] != PAYLOAD_LEN:
+    if not ln:
+        if counters is not None: counters["timeout"] += 1
+        return None, "timeout"
+    if ln[0] != PAYLOAD_LEN:
         if counters is not None: counters["len"] += 1
+        # consumir presunto payload + chk para re-sync rápido
+        _ = ser.read(min(ln[0], 255))
+        _ = ser.read(1)
         return None, "len"
 
     payload = ser.read(PAYLOAD_LEN)
@@ -170,7 +222,7 @@ def _decode_payload(payload: bytes):
     Si falla, intenta legacy (8 floats).
     Devuelve dict con: id, seq (o None), v1..v7, raw_floats, fmt
     """
-    assert len(payload) == 32
+    assert len(payload) == PAYLOAD_LEN
 
     # Nuevo: TelFrame
     try:
@@ -221,14 +273,15 @@ def parse_telemetry_data_frame(frame_dict: dict):
     v1 = frame_dict["v1"]; v2 = frame_dict["v2"]; v3 = frame_dict["v3"]
     v4 = frame_dict["v4"]; v5 = frame_dict["v5"]; v6 = frame_dict["v6"]; v7 = frame_dict["v7"]
 
+    # Línea para la consola de la UI
     if seq is not None:
         data_str = (
-            f"[RX] ID={id_hex} count={seq}\n"
+            f"[RX] ID={id_hex} count={seq} state={_status.get('badge','?')}\n"
             f"[RX] FLOATS: {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f},"
         )
     else:
         data_str = (
-            f"[RX] ID={id_hex}\n"
+            f"[RX] ID={id_hex} state={_status.get('badge','?')}\n"
             f"[RX] FLOATS: {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f},"
         )
 
@@ -394,16 +447,15 @@ def receive_data(bucket_id: str,
     Bucle principal:
       - Log inicial estilo Arduino ([CONFIG] + entorno)
       - Emite "Radio Checking" cada 500 ms
-      - Lee frames, decodifica, actualiza latest_data_dict + data_str + new_data_flag
+      - Lee frames, valida, descarta TEST, decodifica, actualiza latest_data_dict + data_str + new_data_flag
       - (Opcional) escribe en Influx
       - Escribe Excel
-      - Muestra [STATS] cada 2 s
+      - Muestra [STATS] cada 2 s (nivel DEBUG)
     """
-    global new_data_flag
+    global new_data_flag, _last_seq, _last_seq_advance_ts
 
     # Nivel de log
-    if debug:
-        logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
     logger.info("Recepción USB-Serial iniciada")
 
     # Influx opcional
@@ -420,7 +472,7 @@ def receive_data(bucket_id: str,
     xlogger = ExcelSessionLogger(piloto, circuito)
     logger.info("[CONFIG] Excel path: %s", xlogger.path)
 
-    # Puerto serie
+    # Puerto serie (abrir UNA vez)
     if port is None:
         port = _auto_detect_port()
     if port is None:
@@ -438,10 +490,12 @@ def receive_data(bucket_id: str,
     logger.info("[CONFIG] Serial: port=%s, baud=%d, frame=AA 55 %02X <32B> XOR", port, baud, PAYLOAD_LEN)
 
     # ===== Estadísticas/contadores =====
-    counters = {"rx": 0, "decode": 0, "timeout": 0, "len": 0, "short": 0, "chk": 0, "decode_fail": 0}
+    counters = {"rx": 0, "decode": 0, "timeout": 0, "len": 0, "short": 0, "chk": 0, "decode_fail": 0, "test": 0}
     last_check_t = time.time()
     last_stats_t = last_check_t
     first_frame_seen = False
+
+    _set_badge("STALE", "esperando primer frame")
 
     logger.info("Leyendo de %s @ %d bps", port, baud)
 
@@ -456,39 +510,73 @@ def receive_data(bucket_id: str,
             payload, err = _read_frame(ser, counters=counters)
 
             if err == "timeout":
-                # tiempo de espera normal, seguimos
-                pass
-            elif err == "len":
-                logger.debug("[ERR] LEN inválida distinta de 32")
-            elif err == "short":
-                logger.debug("[ERR] Payload corto")
-            elif err == "chk":
-                logger.debug("[ERR] Checksum XOR no coincide")
-
-            if payload is None:
-                # imprimir stats cada 2s aunque no haya frames
+                # sin datos por timeout; comprobar STALE por inactividad de SEQ
+                if _last_seq is not None and (now - _last_seq_advance_ts) > _STALE_T:
+                    _set_badge("STALE", "sin avance de SEQ")
+                # stats periódicas
                 if now - last_stats_t >= 2.0:
-                    logger.debug("[STATS] rx=%d decode=%d chk=%d len=%d short=%d timeout=%d decode_fail=%d",
+                    logger.debug("[STATS] rx=%d decode=%d chk=%d len=%d short=%d timeout=%d decode_fail=%d test=%d",
                                  counters["rx"], counters["decode"], counters["chk"],
-                                 counters["len"], counters["short"], counters["timeout"], counters["decode_fail"])
+                                 counters["len"], counters["short"], counters["timeout"],
+                                 counters["decode_fail"], counters["test"])
                     last_stats_t = now
                 continue
+            elif err == "len":
+                logger.debug("[ERR] LEN inválida distinta de 32")
+                _set_badge("BAD", "len inválida")
+                continue
+            elif err == "short":
+                logger.debug("[ERR] Payload corto")
+                _set_badge("BAD", "payload corto")
+                continue
+            elif err == "chk":
+                logger.debug("[ERR] Checksum XOR no coincide")
+                _set_badge("BAD", "checksum XOR")
+                continue
 
-            # Tenemos un frame válido
+            if payload is None:
+                # byte basura: seguimos
+                continue
+
+            # Detección de patrón de prueba (no afecta estado global)
+            if is_test_payload(payload):
+                counters["test"] += 1
+                logger.debug("[TEST] Patrón TEST (rampa o A0..BF) ignorado para este frame.")
+                continue  # no se registra ni se emite a la UI
+
+            # Tenemos un frame válido y no-TEST
             counters["rx"] += 1
-            hexline = _dump_hex(payload)
-            logger.debug("[RX] HEX: %s", hexline)
+            logger.debug("[RX] HEX: %s", _dump_hex(payload))
 
             decoded = _decode_payload(payload)
             if not decoded:
                 counters["decode_fail"] += 1
+                _set_badge("BAD", "decode_fail")
                 logger.debug("[ERR] decode_fail (ni TelFrame ni legacy)")
                 continue
 
             counters["decode"] += 1
+
+            # Chequeo monotónico de secuencia (solo si TelFrame)
             if decoded["seq"] is not None:
-                logger.debug("[RX] ID=%s SEQ=%d", _id_hex(decoded["id"]), decoded["seq"])
+                seq = decoded["seq"] & 0xFFFF
+                if _last_seq is None:
+                    _last_seq = seq
+                    _last_seq_advance_ts = now
+                    _set_badge("LIVE", "primer SEQ")
+                else:
+                    diff = _mod16_diff(seq, _last_seq)
+                    if diff > 0:
+                        _last_seq = seq
+                        _last_seq_advance_ts = now
+                        _set_badge("LIVE", f"SEQ +{diff}")
+                    else:
+                        if (now - _last_seq_advance_ts) > _STALE_T:
+                            _set_badge("STALE", "SEQ detenido")
+                logger.debug("[RX] ID=%s SEQ=%d (%s)", _id_hex(decoded["id"]), seq, _status["badge"])
             else:
+                # Legacy sin SEQ: considerar LIVE al recibir, pero no podemos detectar STALE por SEQ
+                _set_badge("LIVE", "legacy sin SEQ")
                 logger.debug("[RX] ID=%s (legacy)", _id_hex(decoded["id"]))
 
             # Parse lógico (y Point si la lib está instalada)
@@ -500,14 +588,17 @@ def receive_data(bucket_id: str,
                 decoded["v5"], decoded["v6"], decoded["v7"]))
             logger.debug("[RX] FLOATS: %s", fline)
 
-            # Excel
+            # Excel (solo frames válidos y no-TEST)
             id_hex = _id_hex(decoded["id"])
-            xlogger.append(
-                id_hex,
-                decoded.get("seq"),
-                decoded["v1"], decoded["v2"], decoded["v3"], decoded["v4"],
-                decoded["v5"], decoded["v6"], decoded["v7"]
-            )
+            try:
+                xlogger.append(
+                    id_hex,
+                    decoded.get("seq"),
+                    decoded["v1"], decoded["v2"], decoded["v3"], decoded["v4"],
+                    decoded["v5"], decoded["v6"], decoded["v7"]
+                )
+            except Exception as e:
+                logger.warning("Excel append falló: %s", e)
 
             # Influx opcional
             if write_api and pt:
@@ -526,9 +617,10 @@ def receive_data(bucket_id: str,
 
             # stats periódicas cada 2s
             if now - last_stats_t >= 2.0:
-                logger.debug("[STATS] rx=%d decode=%d chk=%d len=%d short=%d timeout=%d decode_fail=%d",
+                logger.debug("[STATS] rx=%d decode=%d chk=%d len=%d short=%d timeout=%d decode_fail=%d test=%d",
                              counters["rx"], counters["decode"], counters["chk"],
-                             counters["len"], counters["short"], counters["timeout"], counters["decode_fail"])
+                             counters["len"], counters["short"], counters["timeout"],
+                             counters["decode_fail"], counters["test"])
                 last_stats_t = now
 
     finally:

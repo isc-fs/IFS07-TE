@@ -1,33 +1,39 @@
-/* rtt_nano.ino  — RF-Nano / nRF24L01+ receiver
- * Forwards each 32-byte radio payload to USB-Serial in a framed binary format:
- *   SOF1(0xAA), SOF2(0x55), LEN(32), PAYLOAD(32B), XOR(payload)
+/* rtt_nano_rx.ino — RF-Nano / nRF24L01+ receiver for STM32 TelFrame
  *
- * Set VERBOSE=1 to also print human-readable diagnostics over Serial.
+ * For each 32-byte radio payload, it:
+ *  - (optional) prints a readable line with id/seq and 7 floats
+ *  - emits a framed binary record on Serial: AA 55 20 <32 bytes> <xor>
+ *
+ * TelFrame on the TX (little-endian):
+ *   uint16_t id;   // bytes 0..1
+ *   uint16_t seq;  // bytes 2..3
+ *   float    v1..v7 (bytes 4..31)
  */
 
 #include <SPI.h>
 #include <RF24.h>
 #include "printf.h"
 
-// ------------------ Config ------------------
+// ------------- Config (must match TX) -------------
 static const uint8_t PIN_CE  = 10;
 static const uint8_t PIN_CSN = 9;
 RF24 radio(PIN_CE, PIN_CSN);
 
-static const uint64_t PIPE_ADDR = 0xE7E7E7E7E7ULL;  // must match TX
-static const uint8_t  CHANNEL   = 76;               // must match TX
-static const uint8_t  PAYLOAD   = 32;               // fixed 32B payload
+static const uint64_t PIPE_ADDR = 0xE7E7E7E7E7ULL; // 5-byte address
+static const uint8_t  CHANNEL   = 76;              // RF_CH
+static const uint8_t  PAYLOAD   = 32;              // fixed payload size
 
-// Serial framing for Python
+// Serial framing to host tool
 static const uint8_t SOF1 = 0xAA;
 static const uint8_t SOF2 = 0x55;
 
-// Toggle console verbosity
-#define VERBOSE 0  // 0: silent framing only | 1: +HEX dump and radio details
+// Verbosity & test helpers
+#define VERBOSE 1            // 0: only binary frames, 1: also human-readable logs
+#define SEND_TEST_PATTERN 0  // MUST be 0 in production
+#define SEND_ACCEL_SWEEP  0  // MUST be 0 in production
 
-// ------------------ Globals ------------------
+// ------------- Globals -------------
 uint8_t buf[PAYLOAD];
-unsigned long lastCheck = 0;
 
 #if VERBOSE
 static void dumpHex(const uint8_t* p, uint8_t n) {
@@ -39,33 +45,36 @@ static void dumpHex(const uint8_t* p, uint8_t n) {
 }
 #endif
 
-// ------------------ Setup ------------------
 void setup() {
   Serial.begin(115200);
 #if defined(USBCON) || defined(ARDUINO_AVR_LEONARDO)
-  while (!Serial) {}   // only needed on native USB boards
+  while (!Serial) {}
 #endif
 
   printf_begin();
+
 #if VERBOSE
   Serial.println(F("Init RF-NANO RX..."));
 #endif
 
   if (!radio.begin()) {
 #if VERBOSE
-    Serial.println(F("ERR: radio.begin() returned false (chip not detected)."));
+    Serial.println(F("ERR: radio.begin() failed (chip not detected)."));
 #endif
   }
 
+  // Must mirror the TX
   radio.setAddressWidth(5);
   radio.setChannel(CHANNEL);
-  radio.setAutoAck(false);        // NO-ACK (must match TX)
-  radio.setDataRate(RF24_1MBPS);  // must match TX
+  radio.setAutoAck(false);           // NO-ACK
+  radio.setDataRate(RF24_1MBPS);
   radio.setCRCLength(RF24_CRC_16);
   radio.setPALevel(RF24_PA_MAX);
 
-  radio.disableDynamicPayloads();
+  radio.disableDynamicPayloads();    // fixed-size payloads
   radio.setPayloadSize(PAYLOAD);
+
+  // Use pipe 1 (pipe 0 also fine—just match EN_RXADDR on TX if you change it)
   radio.openReadingPipe(1, PIPE_ADDR);
   radio.startListening();
 
@@ -77,20 +86,36 @@ void setup() {
 #endif
 }
 
-// ------------------ Main loop ------------------
 void loop() {
-#if VERBOSE
-  unsigned long now = millis();
-  if (now - lastCheck >= 500) {
-    lastCheck = now;
-    Serial.println(F("Radio Checking"));
+  if (!radio.available()) {
+    return; // nothing to read
   }
-#endif
 
-  if (!radio.available()) return;
-
+  // Drain RX FIFO to keep up at higher rates
   while (radio.available()) {
     radio.read(buf, PAYLOAD);
+
+#if SEND_ACCEL_SWEEP
+    // (kept for reference; MUST stay disabled in production)
+    static float f[8] = {0};
+    static int dir = +1; static unsigned long pt = 0;
+    unsigned long t = millis();
+    if (t - pt > 20) {
+      pt = t;
+      f[1] += dir * 0.02f;
+      if (f[1] >= 1.0f) { f[1] = 1.0f; dir = -1; }
+      if (f[1] <= 0.0f) { f[1] = 0.0f; dir = +1; }
+      memcpy(buf, f, 32);
+    }
+#endif
+
+    // ---------- Decode STM32 TelFrame ----------
+    // Little-endian on both sides (AVR is little-endian)
+    uint16_t id  = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+    uint16_t seq = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+
+    float v[7];
+    memcpy(v, buf + 4, 7 * sizeof(float));
 
 #if VERBOSE
     // (A) HEX dump
@@ -98,30 +123,25 @@ void loop() {
     dumpHex(buf, PAYLOAD);
     Serial.println();
 
-    // (B) Decode as 8 floats (for quick eyeballing)
-    float f[8];
-    memcpy(f, buf, 32); // AVR and STM32 are little-endian IEEE754
-    Serial.print(F("[RX] FLOATS: "));
-    for (int i = 0; i < 8; ++i) {
-      Serial.print(f[i], 2);
-      if (i != 7) Serial.print(F(", "));
+    // (B) Proper view
+    Serial.print(F("[RX] ID=0x")); Serial.print(id, HEX);
+    Serial.print(F(" seq="));      Serial.print(seq);
+    Serial.print(F(" | v: "));
+    for (int i = 0; i < 7; ++i) {
+      Serial.print(v[i], 2);
+      if (i != 6) Serial.print(F(", "));
     }
     Serial.println();
-
-    // (C) Optional: interpret first field as ID (TelFrame.id or legacy f[0])
-    uint32_t id = (uint32_t)f[0];
-    Serial.print(F("[RX] ID=0x"));
-    Serial.println(id, HEX);
 #endif
 
-    // ---- Binary frame to Python: AA 55 20 <32 bytes> <xor> ----
+    // ---------- Binary frame to host: AA 55 20 <32B> <xor> ----------
     uint8_t xorv = 0;
     for (uint8_t i = 0; i < PAYLOAD; ++i) xorv ^= buf[i];
 
     Serial.write(SOF1);
     Serial.write(SOF2);
-    Serial.write(PAYLOAD);      // length byte
-    Serial.write(buf, PAYLOAD); // raw payload (32 bytes)
-    Serial.write(xorv);         // XOR checksum of payload
+    Serial.write(PAYLOAD);      // 0x20
+    Serial.write(buf, PAYLOAD); // raw 32 bytes
+    Serial.write(xorv);         // XOR checksum
   }
 }

@@ -6,6 +6,11 @@ ISCmetrics - Real-Time Telemetry UI
 - Optional InfluxDB (Option A backend)
 - Excel logging to ./logs via backend
 - Debug toggle that streams backend logs into the UI
+
+NOVEDADES UI (robustez):
+- Badge LIVE / STALE / TEST / BAD en la cabecera (colores y motivo)
+- Si STALE/TEST/BAD: se "congela" la UI (no actualiza números ni gráficas) y se atenúan
+- Panel 'ACELERADOR' con Raw1/Raw2, Escalado y Clamped (0..100 %)
 """
 
 import os
@@ -54,6 +59,7 @@ class TkTextHandler(logging.Handler):
         try:
             msg = self.format(record)
             ts = time.strftime("%H:%M:%S")
+
             def append():
                 self.text_widget.insert(tk.END, f"[{ts}] {msg}\n")
                 self.text_widget.see(tk.END)
@@ -61,6 +67,7 @@ class TkTextHandler(logging.Handler):
                 lines = self.text_widget.get("1.0", tk.END).split("\n")
                 if len(lines) > 600:
                     self.text_widget.delete("1.0", f"{len(lines)-600}.0")
+
             # schedule on UI thread
             self.text_widget.after(0, append)
         except Exception:
@@ -94,26 +101,33 @@ class TelemetryUI:
 
         # Historias para plots
         self.throttle_history = deque(maxlen=200)
-        self.brake_history   = deque(maxlen=200)
-        self.time_history    = deque(maxlen=200)
+        self.brake_history = deque(maxlen=200)
+        self.time_history = deque(maxlen=200)
 
         # Listas demo
-        self.pilots_list   = ["J. Landa", "M. Lorenzo", "A. Montero", "F. Tobar", "Chefo"]
+        self.pilots_list = ["J. Landa", "M. Lorenzo", "A. Montero", "F. Tobar", "Chefo"]
         self.circuits_list = ["Boadilla", "Jarama", "Montmeló", "Hockenheim"]
 
         # Tk variables (root already exists)
         self.selected_port = tk.StringVar(self.root, value="")
         self.selected_baud = tk.IntVar(self.root, value=115200)
         self.use_influx_var = tk.BooleanVar(self.root, value=False)
-        self.debug_var      = tk.BooleanVar(self.root, value=True)   # <-- NEW: default ON to learn
-        self.piloto_var    = tk.StringVar(self.root, value=self.pilots_list[0])
-        self.circuito_var  = tk.StringVar(self.root, value=self.circuits_list[0])
-        self.status_var    = tk.StringVar(self.root, value="Listo.")
+        self.debug_var = tk.BooleanVar(self.root, value=True)  # default ON
+        self.piloto_var = tk.StringVar(self.root, value=self.pilots_list[0])
+        self.circuito_var = tk.StringVar(self.root, value=self.circuits_list[0])
+        self.status_var = tk.StringVar(self.root, value="Listo.")
+
+        # Estado de badge (se actualiza desde backend __STATUS__)
+        self.link_badge = tk.StringVar(self.root, value="STALE")
+        self.link_reason = tk.StringVar(self.root, value="inicio")
+
+        # Para “congelar” la UI cuando STALE/TEST/BAD
+        self.freeze_ui = True
 
     # -------------------- UI raíz --------------------
     def setup_ui(self):
         # Grid root
-        for i in range(8):
+        for i in range(9):
             self.root.grid_columnconfigure(i, weight=1)
         for i in range(8):
             self.root.grid_rowconfigure(i, weight=1)
@@ -136,7 +150,7 @@ class TelemetryUI:
     # -------------------- Header --------------------
     def create_header(self):
         center_frame = tk.Frame(self.root, bg="#101010")
-        center_frame.grid(row=0, column=0, columnspan=8, sticky="n", pady=10)
+        center_frame.grid(row=0, column=0, columnspan=7, sticky="n", pady=10)
 
         title_kwargs = dict(
             text="ISCmetrics",
@@ -177,8 +191,34 @@ class TelemetryUI:
             title = tk.Label(center_frame, **title_kwargs)
         title.pack()
 
+        # Right side controls (min/close + badge)
         right_frame = tk.Frame(self.root, bg="#101010")
-        right_frame.grid(row=0, column=7, sticky="ne", padx=10, pady=10)
+        right_frame.grid(row=0, column=7, columnspan=2, sticky="ne", padx=10, pady=10)
+
+        # Badge
+        self.badge_label = tk.Label(
+            right_frame,
+            textvariable=self.link_badge,
+            font=("Inter", 12, "bold"),
+            fg="#000000",
+            bg="#808080",
+            padx=10,
+            pady=4,
+            relief="flat",
+            width=8
+        )
+        self.badge_label.pack(side="left", padx=(0, 10))
+        # Motivo (pequeño)
+        self.badge_reason_label = tk.Label(
+            right_frame,
+            textvariable=self.link_reason,
+            font=("Inter", 9),
+            fg="#BBBBBB",
+            bg="#101010",
+            anchor="e",
+            width=24
+        )
+        self.badge_reason_label.pack(side="left", padx=(0, 10))
 
         btn_min = tk.Button(
             right_frame, text="—", font=("Inter", 14, "bold"),
@@ -198,7 +238,7 @@ class TelemetryUI:
     def create_controls(self):
         # Selects (fila 1)
         selects_frame = tk.Frame(self.root, bg="#101010")
-        selects_frame.grid(row=1, column=0, columnspan=8, sticky="n", pady=(5, 0))
+        selects_frame.grid(row=1, column=0, columnspan=9, sticky="n", pady=(5, 0))
 
         form = tk.Frame(selects_frame, bg="#101010")
         form.pack()
@@ -221,7 +261,7 @@ class TelemetryUI:
 
         # Puerto serie + Baud + Influx + Debug (fila 2)
         io_frame = tk.Frame(self.root, bg="#101010")
-        io_frame.grid(row=2, column=0, columnspan=8, sticky="n", pady=(0, 10))
+        io_frame.grid(row=2, column=0, columnspan=9, sticky="n", pady=(0, 10))
 
         # Puerto
         tk.Label(io_frame, text="Puerto", font=("Inter", 12), fg="#FFFFFF", bg="#101010").grid(
@@ -278,7 +318,7 @@ class TelemetryUI:
 
         # Extra row: open logs
         tools_frame = tk.Frame(self.root, bg="#101010")
-        tools_frame.grid(row=2, column=0, columnspan=8, sticky="s", pady=(40, 0))
+        tools_frame.grid(row=2, column=0, columnspan=9, sticky="s", pady=(40, 0))
         open_logs_btn = tk.Button(
             tools_frame, text="Abrir carpeta logs", font=("Inter", 11),
             fg="#FFFFFF", bg="#303030", activebackground="#505050",
@@ -352,11 +392,26 @@ class TelemetryUI:
                                          font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.torque_est_label.pack(pady=2)
 
+        # ACELERADOR (nuevo: raw/escalado/clamped)
+        accel_frame = tk.LabelFrame(self.root, text="ACELERADOR",
+                                    font=("Inter", 12, "bold"), fg="#00BFFF",
+                                    bg="#101010", bd=2)
+        accel_frame.grid(row=4, column=4, columnspan=2, padx=5, pady=5, sticky="nsew")
+
+        self.accel_raw1_label = tk.Label(accel_frame, text="Raw1: --", font=("Inter", 13), fg="#FFFFFF", bg="#101010")
+        self.accel_raw1_label.pack(pady=2)
+        self.accel_raw2_label = tk.Label(accel_frame, text="Raw2: --", font=("Inter", 13), fg="#FFFFFF", bg="#101010")
+        self.accel_raw2_label.pack(pady=2)
+        self.accel_scaled_label = tk.Label(accel_frame, text="Escalado: -- %", font=("Inter", 13), fg="#FFFFFF", bg="#101010")
+        self.accel_scaled_label.pack(pady=2)
+        self.accel_clamped_label = tk.Label(accel_frame, text="Clamped: -- %", font=("Inter", 13, "bold"), fg="#FFFFFF", bg="#101010")
+        self.accel_clamped_label.pack(pady=2)
+
         # LOG
         log_frame = tk.LabelFrame(self.root, text="LOG",
                                   font=("Inter", 12, "bold"), fg="#FFFFFF",
                                   bg="#101010", bd=2)
-        log_frame.grid(row=6, column=0, columnspan=8, padx=5, pady=5, sticky="nsew")
+        log_frame.grid(row=6, column=0, columnspan=9, padx=5, pady=5, sticky="nsew")
 
         self.telemetry_display = st.ScrolledText(
             log_frame, width=100, height=12, font=("Consolas", 10),
@@ -367,7 +422,7 @@ class TelemetryUI:
     # -------------------- Gráficos --------------------
     def create_graphs(self):
         graphs_frame = tk.Frame(self.root, bg="#101010")
-        graphs_frame.grid(row=5, column=0, columnspan=8, padx=5, pady=5, sticky="nsew")
+        graphs_frame.grid(row=5, column=0, columnspan=9, padx=5, pady=5, sticky="nsew")
 
         plt.style.use("dark_background")
         self.fig = Figure(figsize=(12, 4), facecolor="#101010")
@@ -391,15 +446,15 @@ class TelemetryUI:
     # -------------------- Statusbar --------------------
     def create_statusbar(self):
         sb = tk.Frame(self.root, bg="#151515")
-        sb.grid(row=7, column=0, columnspan=8, sticky="ew")
-        for i in range(8):
+        sb.grid(row=7, column=0, columnspan=9, sticky="ew")
+        for i in range(9):
             sb.grid_columnconfigure(i, weight=1)
 
         self.status_label = tk.Label(
             sb, textvariable=self.status_var, anchor="w",
             font=("Inter", 11), fg="#DDDDDD", bg="#151515", padx=8, pady=4
         )
-        self.status_label.grid(row=0, column=0, columnspan=8, sticky="ew")
+        self.status_label.grid(row=0, column=0, columnspan=9, sticky="ew")
 
     # -------------------- Logging bridge --------------------
     def setup_logging_bridge(self):
@@ -474,7 +529,7 @@ class TelemetryUI:
             ISC_RTT.new_data_flag = 0
             self.receiving_flag = True
 
-            piloto   = self.piloto_var.get()
+            piloto = self.piloto_var.get()
             circuito = self.circuito_var.get()
 
             bucket_id = ISC_RTT.create_bucket(piloto, circuito, use_influx=use_influx)
@@ -496,7 +551,7 @@ class TelemetryUI:
             self.stop_button.config(state="normal", bg="#CC0000")
 
             mode = "con Influx" if use_influx else "sin Influx"
-            dbg  = "DEBUG ON" if debug_mode else "DEBUG OFF"
+            dbg = "DEBUG ON" if debug_mode else "DEBUG OFF"
             msg = f"Iniciando telemetría ({mode}, {dbg}): {piloto} en {circuito} | {port} @ {baud}"
             self.log_message(msg)
             self.status_var.set(msg)
@@ -534,7 +589,12 @@ class TelemetryUI:
             try:
                 if ISC_RTT.new_data_flag == 1:
                     latest_data = ISC_RTT.get_latest_data()
-                    self.root.after(0, self.update_data_displays, latest_data)
+                    # Actualiza badge/estado y decide si congelar
+                    self.root.after(0, self.update_badge_and_freeze, latest_data.get("__STATUS__", {}))
+                    # Solo avanzar displays si no está congelada (se decide en update_badge_and_freeze)
+                    if latest_data:
+                        self.root.after(0, self.update_data_displays, latest_data)
+                    # Log de línea de backend
                     self.root.after(0, self.log_message, ISC_RTT.data_str)
                     ISC_RTT.new_data_flag = 0
                 time.sleep(0.01)
@@ -542,8 +602,60 @@ class TelemetryUI:
                 self.root.after(0, self.log_message, f"Error actualizando UI: {e}")
                 break
 
+    # -------------------- Badge + congelación --------------------
+    def update_badge_and_freeze(self, status_obj: dict):
+        badge = str(status_obj.get("badge", "STALE")).upper()
+        reason = str(status_obj.get("reason", ""))
+        self.link_badge.set(badge)
+        self.link_reason.set(reason)
+
+        # Color según badge
+        color_map = {
+            "LIVE": "#00FF00",
+            "STALE": "#BFBF00",
+            "TEST": "#FF8C00",
+            "BAD": "#FF3333",
+        }
+        bg = color_map.get(badge, "#808080")
+        self.badge_label.config(bg=bg, fg="#000000")
+
+        # Congelar UI si no es LIVE
+        self.freeze_ui = (badge in {"STALE", "BAD"})
+        self._set_widgets_dim(self.freeze_ui)
+
+    def _set_widgets_dim(self, dim: bool):
+        """Atenúa labels y gráfica cuando está STALE/TEST/BAD."""
+        fg_dim = "#888888"
+        fg_norm = "#FFFFFF"
+
+        labels = [
+            self.accu_voltage_label, self.accu_current_label, self.accu_power_label,
+            self.temp_accu_label, self.temp_motor_label, self.temp_inverter_label,
+            self.inverter_status_label, self.inverter_errors_label,
+            self.torque_req_label, self.torque_est_label,
+            self.accel_raw1_label, self.accel_raw2_label,
+            self.accel_scaled_label, self.accel_clamped_label,
+        ]
+        for lb in labels:
+            try:
+                lb.config(fg=fg_dim if dim else fg_norm)
+            except Exception:
+                pass
+
+        # Grises en los ejes (solo retitular; la curva se pinta/omite en update_pedal_graphs)
+        tcolor = fg_dim if dim else "#FFFFFF"
+        try:
+            self.ax_throttle.set_title("ACELERADOR (%)", color=tcolor, fontsize=12, fontweight="bold")
+            self.ax_brake.set_title("FRENO (%)", color=tcolor, fontsize=12, fontweight="bold")
+            self.canvas.draw()
+        except Exception:
+            pass
+
     # -------------------- Render de datos --------------------
     def update_data_displays(self, data: dict):
+        # Si está congelada, no actualizamos valores (mostramos los últimos)
+        if self.freeze_ui:
+            return
         try:
             # ACCUMULATOR (0x640)
             if "0x640" in data:
@@ -555,7 +667,7 @@ class TelemetryUI:
                 if "cell_max_temp" in accu:
                     temp = float(accu["cell_max_temp"])
                     color = "#FF0000" if temp > 50 else "#FFA500" if temp > 40 else "#FFFFFF"
-                    self.temp_accu_label.config(text=f"Accu Max: {temp:.1f} °C", fg=color)
+                    self.temp_accu_label.config(text=f"Accu Max: {temp:.1f} °C", fg=color if not self.freeze_ui else "#888888")
 
             # POWERTRAIN (0x620) – compat rellenada por backend desde 0x600
             if "0x620" in data:
@@ -576,11 +688,13 @@ class TelemetryUI:
                     status = int(inv["status"])
                     status_text = "CONECTADO" if status == 1 else "DESCONECTADO"
                     status_color = "#00FF00" if status == 1 else "#FF0000"
-                    self.inverter_status_label.config(text=f"Estado: {status_text}", fg=status_color)
+                    self.inverter_status_label.config(text=f"Estado: {status_text}",
+                                                      fg=status_color if not self.freeze_ui else "#888888")
                 if "errors" in inv:
                     errors = int(inv["errors"])
                     error_color = "#FF0000" if errors > 0 else "#FFFFFF"
-                    self.inverter_errors_label.config(text=f"Errores: {errors}", fg=error_color)
+                    self.inverter_errors_label.config(text=f"Errores: {errors}",
+                                                      fg=error_color if not self.freeze_ui else "#888888")
 
             # DRIVER INPUTS (0x630)
             if "0x630" in data:
@@ -589,14 +703,44 @@ class TelemetryUI:
                     self.torque_req_label.config(text=f"Solicitado: {drv['torque_req']:.1f} Nm")
                 if "torque_est" in drv:
                     self.torque_est_label.config(text=f"Estimado: {drv['torque_est']:.1f} Nm")
-                if "throttle" in drv and "brake" in drv:
-                    self.update_pedal_graphs(drv["throttle"], drv["brake"])
+                # Pedales
+                throttle = None
+                brake = None
+                if "throttle" in drv:
+                    throttle = float(drv["throttle"])
+                if "brake" in drv:
+                    brake = float(drv["brake"])
+                if throttle is not None and brake is not None:
+                    self.update_pedal_graphs(throttle, brake)
+
+            # ACELERADOR – raw/escalado/clamped (fuente 0x600 y 0x630)
+            raw1 = raw2 = None
+            scaled = None
+            if "0x600" in data:
+                m600 = data["0x600"]
+                raw1 = m600.get("throttle_raw1", None)
+                raw2 = m600.get("throttle_raw2", None)
+            if "0x630" in data:
+                m630 = data["0x630"]
+                scaled = m630.get("throttle", None)
+
+            if raw1 is not None:
+                self.accel_raw1_label.config(text=f"Raw1: {raw1:.2f}")
+            if raw2 is not None:
+                self.accel_raw2_label.config(text=f"Raw2: {raw2:.2f}")
+            if scaled is not None:
+                clamped = max(0.0, min(100.0, float(scaled)))
+                self.accel_scaled_label.config(text=f"Escalado: {scaled:.2f} %")
+                self.accel_clamped_label.config(text=f"Clamped:  {clamped:.2f} %")
 
         except Exception as e:
             self.log_message(f"Error actualizando displays: {e}")
 
     # -------------------- Gráficas pedales --------------------
     def update_pedal_graphs(self, throttle: float, brake: float):
+        # Si está congelada, no repintamos (quedan los últimos)
+        if self.freeze_ui:
+            return
         try:
             t_now = time.time()
             self.throttle_history.append(float(throttle))
