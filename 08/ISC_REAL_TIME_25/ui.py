@@ -48,6 +48,63 @@ if sys.platform.startswith("linux") and "DISPLAY" not in os.environ:
     os.environ["DISPLAY"] = ":0"
 
 
+# -------- Tunables for header logo & spacing --------
+LOGO_MAX_HEIGHT = 44   # compact header logo height
+LOGO_VPAD_PX    = 6    # transparent vertical padding inside the image
+ROW0_PADY       = 2    # header top/bottom padding
+ROW1_PADY       = (2, 0)
+ROW2_PADY       = (0, 6)
+GRAPHS_PADY     = 4
+STATUS_PADY     = 0
+
+
+# -------- path + platform helpers --------
+def resource_path(*parts):
+    """
+    Robust path resolver:
+    - Dev mode: relative to this file's directory
+    - PyInstaller: uses sys._MEIPASS when present
+    - Also tries project subfolder 'ISC_REAL_TIME_25' and CWD as fallbacks
+    """
+    candidates = []
+    try:
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        candidates.append(os.path.join(base, *parts))
+    except Exception:
+        pass
+    candidates.append(os.path.join("ISC_REAL_TIME_25", *parts))   # legacy folder
+    candidates.append(os.path.join(os.getcwd(), *parts))           # cwd fallback
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0]
+
+
+def is_windows():
+    return sys.platform.startswith("win")
+
+
+def load_logo_with_padding(png_path, max_h=LOGO_MAX_HEIGHT, vpad_px=LOGO_VPAD_PX):
+    """
+    Load PNG, scale by height (preserving aspect), add transparent vertical padding.
+    Returns a PIL.Image or None if PIL isn't available.
+    """
+    if not (Image and ImageTk):
+        return None
+    img = Image.open(png_path).convert("RGBA")
+    w, h = img.size
+    if h > max_h:
+        new_w = max(1, int(w * (max_h / float(h))))
+        try:
+            img = img.resize((new_w, max_h), Image.Resampling.LANCZOS)
+        except Exception:
+            img = img.resize((new_w, max_h), Image.LANCZOS)
+    pad_h = img.height + 2 * vpad_px
+    padded = Image.new("RGBA", (img.width, pad_h), (0, 0, 0, 0))
+    padded.paste(img, (0, vpad_px), img)
+    return padded
+
+
 # -------- logger -> Tk text handler --------
 class TkTextHandler(logging.Handler):
     """Send logging records to a Tkinter ScrolledText safely."""
@@ -68,7 +125,6 @@ class TkTextHandler(logging.Handler):
                 if len(lines) > 600:
                     self.text_widget.delete("1.0", f"{len(lines)-600}.0")
 
-            # schedule on UI thread
             self.text_widget.after(0, append)
         except Exception:
             self.handleError(record)
@@ -76,21 +132,40 @@ class TkTextHandler(logging.Handler):
 
 class TelemetryUI:
     def __init__(self):
-        # Root FIRST (fixes "Too early to create variable")
+        # Root FIRST
         self.root = tk.Tk()
         self.root.title("ISCmetrics")
         self.root.attributes("-fullscreen", True)
         self.root.configure(bg="#101010")
 
-        self.tk_logo = None  # keep ref if we set iconphoto
+        # Early log buffer (avoid using log widget before it exists)
+        self._early_logs = []
+
+        # Keep references to images
+        self.tk_logo = None
 
         self.setup_data_structures()
-        self.setup_ui()
-        self.setup_logging_bridge()  # after widgets exist
+        self.setup_ui()               # builds header, controls, displays (log widget)
+        self._flush_early_logs()      # now the log widget exists
+        self.setup_logging_bridge()   # route backend logger into UI
+
+    # -------------------- Early logging helpers --------------------
+    def _elog(self, message: str):
+        """Safe early log: buffer until telemetry_display exists + print to stdout."""
+        try:
+            print(message)
+        except Exception:
+            pass
+        self._early_logs.append(message)
+
+    def _flush_early_logs(self):
+        if hasattr(self, "telemetry_display"):
+            for m in self._early_logs:
+                self.log_message(m)
+            self._early_logs = []
 
     # -------------------- Infra de estado --------------------
     def setup_data_structures(self):
-        """Inicializa estructuras de datos / estado UI"""
         self.data_queue = queue.Queue()
 
         # Flags/threads
@@ -108,20 +183,20 @@ class TelemetryUI:
         self.pilots_list = ["J. Landa", "M. Lorenzo", "A. Montero", "F. Tobar", "Chefo"]
         self.circuits_list = ["Boadilla", "Jarama", "Montmeló", "Hockenheim"]
 
-        # Tk variables (root already exists)
+        # Tk variables
         self.selected_port = tk.StringVar(self.root, value="")
         self.selected_baud = tk.IntVar(self.root, value=115200)
         self.use_influx_var = tk.BooleanVar(self.root, value=False)
-        self.debug_var = tk.BooleanVar(self.root, value=True)  # default ON
+        self.debug_var = tk.BooleanVar(self.root, value=True)
         self.piloto_var = tk.StringVar(self.root, value=self.pilots_list[0])
         self.circuito_var = tk.StringVar(self.root, value=self.circuits_list[0])
         self.status_var = tk.StringVar(self.root, value="Listo.")
 
-        # Estado de badge (se actualiza desde backend __STATUS__)
+        # Estado de badge
         self.link_badge = tk.StringVar(self.root, value="STALE")
         self.link_reason = tk.StringVar(self.root, value="inicio")
 
-        # Para “congelar” la UI cuando STALE/TEST/BAD
+        # Congelar UI cuando STALE/BAD
         self.freeze_ui = True
 
     # -------------------- UI raíz --------------------
@@ -134,7 +209,7 @@ class TelemetryUI:
 
         self.create_header()
         self.create_controls()
-        self.create_data_displays()
+        self.create_data_displays()   # creates self.telemetry_display
         self.create_graphs()
         self.create_statusbar()
         self.setup_bindings()
@@ -147,142 +222,161 @@ class TelemetryUI:
         self.root.bind("<F11>", self.toggle_fullscreen)
         self.root.bind("<Control-m>", lambda e: self.minimize_window())
 
-    # -------------------- Header --------------------
+    # -------------------- Cabecera (top-left logo + title) --------------------
     def create_header(self):
-        center_frame = tk.Frame(self.root, bg="#101010")
-        center_frame.grid(row=0, column=0, columnspan=7, sticky="n", pady=10)
+        """
+        Header layout:
+        [ left_group: logo + "ISCmetrics" ] | [ spacer ] | [ right controls ]
+        """
+        header_bar = tk.Frame(self.root, bg="#101010")
+        header_bar.grid(row=0, column=0, columnspan=9, sticky="ew", pady=ROW0_PADY, padx=10)
+        header_bar.grid_columnconfigure(0, weight=0)  # left anchored
+        header_bar.grid_columnconfigure(1, weight=1)  # spacer
+        header_bar.grid_columnconfigure(2, weight=0)  # right controls
 
-        title_kwargs = dict(
+        left_group = tk.Frame(header_bar, bg="#101010")
+        left_group.grid(row=0, column=0, sticky="nw")
+
+        right_frame = tk.Frame(header_bar, bg="#101010")
+        right_frame.grid(row=0, column=2, sticky="ne")
+
+        # ---- Resolve assets
+        ico_path = resource_path("isc_logo.ico")
+        png_path = resource_path("isc_logo.png")
+
+        # Windows taskbar icon (.ico)
+        if is_windows() and os.path.exists(ico_path):
+            try:
+                self.root.iconbitmap(ico_path)
+                self._elog(f"[ICON] Using ICO for taskbar: {ico_path}")
+            except Exception as e:
+                self._elog(f"[ICON] iconbitmap failed: {e}")
+
+        # ---- Header logo image (small, aspect preserved, padded)
+        self.tk_logo = None
+        if os.path.exists(png_path):
+            try:
+                if Image and ImageTk:
+                    pil_img = load_logo_with_padding(png_path, LOGO_MAX_HEIGHT, LOGO_VPAD_PX)
+                    if pil_img is None:
+                        self.tk_logo = tk.PhotoImage(file=png_path)
+                        self._elog(f"[ICON] PNG via Tk PhotoImage (no PIL): {png_path} -> {self.tk_logo.width()}x{self.tk_logo.height()}")
+                    else:
+                        self.tk_logo = ImageTk.PhotoImage(pil_img)
+                        self._elog(f"[ICON] PNG via Pillow (small, padded): {png_path} -> {self.tk_logo.width()}x{self.tk_logo.height()}")
+                else:
+                    # Fallback without PIL (no resize/padding)
+                    self.tk_logo = tk.PhotoImage(file=png_path)
+                    self._elog(f"[ICON] PNG via Tk PhotoImage (no PIL): {png_path} -> {self.tk_logo.width()}x{self.tk_logo.height()}")
+            except Exception as e:
+                self._elog(f"[ICON] Failed to load PNG logo: {png_path} ({e})")
+        else:
+            self._elog(f"[ICON] PNG not found: {png_path}")
+
+        # Set window iconphoto on all platforms (in addition to iconbitmap on Win)
+        if self.tk_logo:
+            try:
+                self.root.iconphoto(True, self.tk_logo)
+            except Exception as e:
+                self._elog(f"[ICON] iconphoto failed: {e}")
+
+        # ---- Left: logo + title (tight spacing, top-left anchored)
+        if self.tk_logo:
+            tk.Label(left_group, image=self.tk_logo, bg="#101010").pack(side="left")
+        else:
+            tk.Label(left_group, text=" ", bg="#101010").pack(side="left")
+
+        title_lbl = tk.Label(
+            left_group,
             text="ISCmetrics",
-            font=("Inter", 22, "bold"),
+            font=("Inter", 17, "bold"),
             fg="#FFFFFF",
             bg="#101010",
+            padx=8
         )
+        title_lbl.pack(side="left")
 
-        icon_set = False
-        if Image and ImageTk:
-            try:
-                # Try .ico for the window icon first
-                ico_path = os.path.join("ISC_REAL_TIME_25", "isc_logo.ico")
-                if os.path.exists(ico_path) and sys.platform.startswith("win"):
-                    try:
-                        self.root.iconbitmap(ico_path)
-                        icon_set = True
-                    except Exception:
-                        icon_set = False
-
-                # PNG for title + iconphoto fallback
-                png_path = os.path.join("ISC_REAL_TIME_25", "isc_logo.png")
-                if os.path.exists(png_path):
-                    logo = Image.open(png_path)
-                    logo = logo.resize((50, 50), Image.Resampling.LANCZOS)
-                    self.tk_logo = ImageTk.PhotoImage(logo)
-                    if not icon_set:
-                        try:
-                            self.root.iconphoto(True, self.tk_logo)
-                        except Exception:
-                            pass
-                    title = tk.Label(center_frame, image=self.tk_logo, compound="left", padx=10, **title_kwargs)
-                else:
-                    title = tk.Label(center_frame, **title_kwargs)
-            except Exception:
-                title = tk.Label(center_frame, **title_kwargs)
-        else:
-            title = tk.Label(center_frame, **title_kwargs)
-        title.pack()
-
-        # Right side controls (min/close + badge)
-        right_frame = tk.Frame(self.root, bg="#101010")
-        right_frame.grid(row=0, column=7, columnspan=2, sticky="ne", padx=10, pady=10)
-
-        # Badge
+        # ---- Right side controls (badge + buttons)
         self.badge_label = tk.Label(
-            right_frame,
-            textvariable=self.link_badge,
-            font=("Inter", 12, "bold"),
-            fg="#000000",
-            bg="#808080",
-            padx=10,
-            pady=4,
-            relief="flat",
-            width=8
+            right_frame, textvariable=self.link_badge, font=("Inter", 11, "bold"),
+            fg="#000000", bg="#808080", padx=8, pady=3, relief="flat", width=8
         )
-        self.badge_label.pack(side="left", padx=(0, 10))
-        # Motivo (pequeño)
+        self.badge_label.pack(side="left", padx=(0, 8))
+
         self.badge_reason_label = tk.Label(
-            right_frame,
-            textvariable=self.link_reason,
-            font=("Inter", 9),
-            fg="#BBBBBB",
-            bg="#101010",
-            anchor="e",
-            width=24
+            right_frame, textvariable=self.link_reason, font=("Inter", 9),
+            fg="#BBBBBB", bg="#101010", anchor="e", width=24
         )
-        self.badge_reason_label.pack(side="left", padx=(0, 10))
+        self.badge_reason_label.pack(side="left", padx=(0, 8))
 
         btn_min = tk.Button(
-            right_frame, text="—", font=("Inter", 14, "bold"),
+            right_frame, text="—", font=("Inter", 13, "bold"),
             fg="#FFFFFF", bg="#303030", activebackground="#505050",
             width=3, borderwidth=0, command=self.minimize_window
         )
         btn_min.pack(side="left", padx=(0, 6))
 
         btn_close = tk.Button(
-            right_frame, text="×", font=("Inter", 14, "bold"),
+            right_frame, text="×", font=("Inter", 13, "bold"),
             fg="#FFFFFF", bg="#C43131", activebackground="#E04B4B",
             width=3, borderwidth=0, command=self.close_window
         )
         btn_close.pack(side="left")
 
+        # Debug info (buffered until log exists)
+        self._elog(f"[ICON] CWD: {os.getcwd()}")
+        self._elog(f"[ICON] Resolved ICO: {ico_path} (exists={os.path.exists(ico_path)})")
+        self._elog(f"[ICON] Resolved PNG: {png_path} (exists={os.path.exists(png_path)})")
+
     # -------------------- Controles superiores --------------------
     def create_controls(self):
-        # Selects (fila 1)
+        # Selects (fila 1) — tighter padding to pull UI up
         selects_frame = tk.Frame(self.root, bg="#101010")
-        selects_frame.grid(row=1, column=0, columnspan=9, sticky="n", pady=(5, 0))
+        selects_frame.grid(row=1, column=0, columnspan=9, sticky="n", pady=ROW1_PADY)
 
         form = tk.Frame(selects_frame, bg="#101010")
-        form.pack()
+        form.pack(anchor="w")
 
         # Piloto
-        tk.Label(form, text="Piloto", font=("Inter", 14), fg="#FFFFFF", bg="#101010").grid(
-            row=0, column=0, padx=10, pady=(5, 2), sticky="s"
+        tk.Label(form, text="Piloto", font=("Inter", 13), fg="#FFFFFF", bg="#101010").grid(
+            row=0, column=0, padx=8, pady=(2, 2), sticky="s"
         )
         self.pilot_menu = tk.OptionMenu(form, self.piloto_var, *self.pilots_list)
         self.pilot_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020", highlightthickness=0, bd=0)
-        self.pilot_menu.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
+        self.pilot_menu.grid(row=1, column=0, padx=8, pady=(0, 6), sticky="ew")
 
         # Circuito
-        tk.Label(form, text="Circuito", font=("Inter", 14), fg="#FFFFFF", bg="#101010").grid(
-            row=0, column=1, padx=10, pady=(5, 2), sticky="s"
+        tk.Label(form, text="Circuito", font=("Inter", 13), fg="#FFFFFF", bg="#101010").grid(
+            row=0, column=1, padx=8, pady=(2, 2), sticky="s"
         )
         self.circuit_menu = tk.OptionMenu(form, self.circuito_var, *self.circuits_list)
         self.circuit_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020", highlightthickness=0, bd=0)
-        self.circuit_menu.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="ew")
+        self.circuit_menu.grid(row=1, column=1, padx=8, pady=(0, 6), sticky="ew")
 
         # Puerto serie + Baud + Influx + Debug (fila 2)
         io_frame = tk.Frame(self.root, bg="#101010")
-        io_frame.grid(row=2, column=0, columnspan=9, sticky="n", pady=(0, 10))
+        io_frame.grid(row=2, column=0, columnspan=9, sticky="n", pady=ROW2_PADY)
 
         # Puerto
         tk.Label(io_frame, text="Puerto", font=("Inter", 12), fg="#FFFFFF", bg="#101010").grid(
-            row=0, column=0, padx=(0, 8), pady=2
+            row=0, column=0, padx=(0, 6), pady=2
         )
         self.port_combo = ttk.Combobox(io_frame, textvariable=self.selected_port, width=24, state="readonly")
-        self.port_combo.grid(row=0, column=1, padx=(0, 8), pady=2)
+        self.port_combo.grid(row=0, column=1, padx=(0, 6), pady=2)
 
         btn_refresh = tk.Button(
             io_frame, text="Actualizar", font=("Inter", 12),
             fg="#FFFFFF", bg="#303030", activebackground="#505050",
             command=self.refresh_ports
         )
-        btn_refresh.grid(row=0, column=2, padx=(0, 16), pady=2)
+        btn_refresh.grid(row=0, column=2, padx=(0, 12), pady=2)
 
         # Baud
         tk.Label(io_frame, text="Baud", font=("Inter", 12), fg="#FFFFFF", bg="#101010").grid(
-            row=0, column=3, padx=(0, 8), pady=2
+            row=0, column=3, padx=(0, 6), pady=2
         )
         self.baud_entry = tk.Entry(io_frame, textvariable=self.selected_baud, width=10, bg="#202020", fg="#00FF00")
-        self.baud_entry.grid(row=0, column=4, padx=(0, 16), pady=2)
+        self.baud_entry.grid(row=0, column=4, padx=(0, 12), pady=2)
 
         # Influx toggle
         self.influx_chk = tk.Checkbutton(
@@ -291,7 +385,7 @@ class TelemetryUI:
             fg="#FFFFFF", bg="#101010", activebackground="#101010",
             selectcolor="#202020"
         )
-        self.influx_chk.grid(row=0, column=5, padx=(0, 16), pady=2, sticky="w")
+        self.influx_chk.grid(row=0, column=5, padx=(0, 12), pady=2, sticky="w")
 
         # Debug toggle
         self.debug_chk = tk.Checkbutton(
@@ -300,25 +394,25 @@ class TelemetryUI:
             fg="#FFFFFF", bg="#101010", activebackground="#101010",
             selectcolor="#202020", command=self._apply_debug_level
         )
-        self.debug_chk.grid(row=0, column=6, padx=(0, 16), pady=2, sticky="w")
+        self.debug_chk.grid(row=0, column=6, padx=(0, 12), pady=2, sticky="w")
 
         # Botones iniciar / parar
         self.run_button = tk.Button(
             io_frame, text="INICIAR", font=("Inter", 14, "bold"),
             fg="#FFFFFF", bg="#006400", command=self.start_receiving, relief="raised", bd=2, width=12
         )
-        self.run_button.grid(row=0, column=7, padx=8)
+        self.run_button.grid(row=0, column=7, padx=6)
 
         self.stop_button = tk.Button(
             io_frame, text="PARAR", font=("Inter", 14, "bold"),
             fg="#FFFFFF", bg="#404040", command=self.stop_receiving,
             relief="raised", bd=2, width=12, state="disabled"
         )
-        self.stop_button.grid(row=0, column=8, padx=8)
+        self.stop_button.grid(row=0, column=8, padx=6)
 
-        # Extra row: open logs
+        # Extra row: open logs (reduced spacing)
         tools_frame = tk.Frame(self.root, bg="#101010")
-        tools_frame.grid(row=2, column=0, columnspan=9, sticky="s", pady=(40, 0))
+        tools_frame.grid(row=2, column=0, columnspan=9, sticky="s", pady=(12, 0))
         open_logs_btn = tk.Button(
             tools_frame, text="Abrir carpeta logs", font=("Inter", 11),
             fg="#FFFFFF", bg="#303030", activebackground="#505050",
@@ -332,7 +426,7 @@ class TelemetryUI:
         accu_frame = tk.LabelFrame(self.root, text="ACUMULADOR",
                                    font=("Inter", 12, "bold"), fg="#00FF00",
                                    bg="#101010", bd=2)
-        accu_frame.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+        accu_frame.grid(row=3, column=0, columnspan=2, padx=5, pady=4, sticky="nsew")
 
         self.accu_voltage_label = tk.Label(accu_frame, text="DC Bus: -- V",
                                            font=("Inter", 14), fg="#FFFFFF", bg="#101010")
@@ -350,7 +444,7 @@ class TelemetryUI:
         temp_frame = tk.LabelFrame(self.root, text="TEMPERATURAS",
                                    font=("Inter", 12, "bold"), fg="#FFA500",
                                    bg="#101010", bd=2)
-        temp_frame.grid(row=3, column=2, columnspan=2, padx=5, pady=5, sticky="nsew")
+        temp_frame.grid(row=3, column=2, columnspan=2, padx=5, pady=4, sticky="nsew")
 
         self.temp_accu_label = tk.Label(temp_frame, text="Accu Max: -- °C",
                                         font=("Inter", 14), fg="#FFFFFF", bg="#101010")
@@ -368,7 +462,7 @@ class TelemetryUI:
         inverter_frame = tk.LabelFrame(self.root, text="ESTADO INVERSOR",
                                        font=("Inter", 12, "bold"), fg="#FF6B6B",
                                        bg="#101010", bd=2)
-        inverter_frame.grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+        inverter_frame.grid(row=4, column=0, columnspan=2, padx=5, pady=4, sticky="nsew")
 
         self.inverter_status_label = tk.Label(inverter_frame, text="Estado: DESCONECTADO",
                                               font=("Inter", 14, "bold"), fg="#FF0000", bg="#101010")
@@ -382,7 +476,7 @@ class TelemetryUI:
         torque_frame = tk.LabelFrame(self.root, text="TORQUE",
                                      font=("Inter", 12, "bold"), fg="#4ECDC4",
                                      bg="#101010", bd=2)
-        torque_frame.grid(row=4, column=2, columnspan=2, padx=5, pady=5, sticky="nsew")
+        torque_frame.grid(row=4, column=2, columnspan=2, padx=5, pady=4, sticky="nsew")
 
         self.torque_req_label = tk.Label(torque_frame, text="Solicitado: -- Nm",
                                          font=("Inter", 14), fg="#FFFFFF", bg="#101010")
@@ -396,7 +490,7 @@ class TelemetryUI:
         accel_frame = tk.LabelFrame(self.root, text="ACELERADOR",
                                     font=("Inter", 12, "bold"), fg="#00BFFF",
                                     bg="#101010", bd=2)
-        accel_frame.grid(row=4, column=4, columnspan=2, padx=5, pady=5, sticky="nsew")
+        accel_frame.grid(row=4, column=4, columnspan=2, padx=5, pady=4, sticky="nsew")
 
         self.accel_raw1_label = tk.Label(accel_frame, text="Raw1: --", font=("Inter", 13), fg="#FFFFFF", bg="#101010")
         self.accel_raw1_label.pack(pady=2)
@@ -411,7 +505,7 @@ class TelemetryUI:
         log_frame = tk.LabelFrame(self.root, text="LOG",
                                   font=("Inter", 12, "bold"), fg="#FFFFFF",
                                   bg="#101010", bd=2)
-        log_frame.grid(row=6, column=0, columnspan=9, padx=5, pady=5, sticky="nsew")
+        log_frame.grid(row=6, column=0, columnspan=9, padx=5, pady=4, sticky="nsew")
 
         self.telemetry_display = st.ScrolledText(
             log_frame, width=100, height=12, font=("Consolas", 10),
@@ -422,7 +516,7 @@ class TelemetryUI:
     # -------------------- Gráficos --------------------
     def create_graphs(self):
         graphs_frame = tk.Frame(self.root, bg="#101010")
-        graphs_frame.grid(row=5, column=0, columnspan=9, padx=5, pady=5, sticky="nsew")
+        graphs_frame.grid(row=5, column=0, columnspan=9, padx=5, pady=GRAPHS_PADY, sticky="nsew")
 
         plt.style.use("dark_background")
         self.fig = Figure(figsize=(12, 4), facecolor="#101010")
@@ -446,7 +540,7 @@ class TelemetryUI:
     # -------------------- Statusbar --------------------
     def create_statusbar(self):
         sb = tk.Frame(self.root, bg="#151515")
-        sb.grid(row=7, column=0, columnspan=9, sticky="ew")
+        sb.grid(row=7, column=0, columnspan=9, sticky="ew", pady=STATUS_PADY)
         for i in range(9):
             sb.grid_columnconfigure(i, weight=1)
 
@@ -465,8 +559,10 @@ class TelemetryUI:
 
         self.backend_logger = logging.getLogger("ISC_RTT_USB")
         self.backend_logger.addHandler(self.tk_log_handler)
-        # initial level from checkbox default
         self._apply_debug_level()
+
+        # Flush anything buffered before the log existed
+        self._flush_early_logs()
 
     def _apply_debug_level(self):
         self.backend_logger.setLevel(logging.DEBUG if self.debug_var.get() else logging.INFO)
@@ -534,7 +630,7 @@ class TelemetryUI:
 
             bucket_id = ISC_RTT.create_bucket(piloto, circuito, use_influx=use_influx)
 
-            # Thread RX (pasamos puerto, baud, influx y debug)
+            # Thread RX
             self.receiving_thread = threading.Thread(
                 target=ISC_RTT.receive_data,
                 args=(bucket_id, piloto, circuito, port, baud, use_influx, debug_mode),
@@ -569,11 +665,11 @@ class TelemetryUI:
             ISC_RTT.new_data_flag = -1
             self.receiving_flag = False
 
-            if self.receiving_thread and self.receiving_thread.is_alive():
-                self.receiving_thread.join(timeout=2.0)
-
-            if self.ui_update_thread and self.ui_update_thread.is_alive():
-                self.ui_update_thread.join(timeout=1.0)
+            if self.receiving_thread and self.ui_update_thread:
+                if self.receiving_thread.is_alive():
+                    self.receiving_thread.join(timeout=2.0)
+                if self.ui_update_thread.is_alive():
+                    self.ui_update_thread.join(timeout=1.0)
 
             self.run_button.config(state="normal", bg="#006400")
             self.stop_button.config(state="disabled", bg="#404040")
@@ -589,12 +685,9 @@ class TelemetryUI:
             try:
                 if ISC_RTT.new_data_flag == 1:
                     latest_data = ISC_RTT.get_latest_data()
-                    # Actualiza badge/estado y decide si congelar
                     self.root.after(0, self.update_badge_and_freeze, latest_data.get("__STATUS__", {}))
-                    # Solo avanzar displays si no está congelada (se decide en update_badge_and_freeze)
                     if latest_data:
                         self.root.after(0, self.update_data_displays, latest_data)
-                    # Log de línea de backend
                     self.root.after(0, self.log_message, ISC_RTT.data_str)
                     ISC_RTT.new_data_flag = 0
                 time.sleep(0.01)
@@ -609,7 +702,6 @@ class TelemetryUI:
         self.link_badge.set(badge)
         self.link_reason.set(reason)
 
-        # Color según badge
         color_map = {
             "LIVE": "#00FF00",
             "STALE": "#BFBF00",
@@ -619,12 +711,10 @@ class TelemetryUI:
         bg = color_map.get(badge, "#808080")
         self.badge_label.config(bg=bg, fg="#000000")
 
-        # Congelar UI si no es LIVE
         self.freeze_ui = (badge in {"STALE", "BAD"})
         self._set_widgets_dim(self.freeze_ui)
 
     def _set_widgets_dim(self, dim: bool):
-        """Atenúa labels y gráfica cuando está STALE/TEST/BAD."""
         fg_dim = "#888888"
         fg_norm = "#FFFFFF"
 
@@ -642,7 +732,6 @@ class TelemetryUI:
             except Exception:
                 pass
 
-        # Grises en los ejes (solo retitular; la curva se pinta/omite en update_pedal_graphs)
         tcolor = fg_dim if dim else "#FFFFFF"
         try:
             self.ax_throttle.set_title("ACELERADOR (%)", color=tcolor, fontsize=12, fontweight="bold")
@@ -653,7 +742,6 @@ class TelemetryUI:
 
     # -------------------- Render de datos --------------------
     def update_data_displays(self, data: dict):
-        # Si está congelada, no actualizamos valores (mostramos los últimos)
         if self.freeze_ui:
             return
         try:
@@ -669,7 +757,7 @@ class TelemetryUI:
                     color = "#FF0000" if temp > 50 else "#FFA500" if temp > 40 else "#FFFFFF"
                     self.temp_accu_label.config(text=f"Accu Max: {temp:.1f} °C", fg=color if not self.freeze_ui else "#888888")
 
-            # POWERTRAIN (0x620) – compat rellenada por backend desde 0x600
+            # POWERTRAIN (0x620)
             if "0x620" in data:
                 pt = data["0x620"]
                 if "dc_bus_voltage" in pt:
@@ -703,7 +791,6 @@ class TelemetryUI:
                     self.torque_req_label.config(text=f"Solicitado: {drv['torque_req']:.1f} Nm")
                 if "torque_est" in drv:
                     self.torque_est_label.config(text=f"Estimado: {drv['torque_est']:.1f} Nm")
-                # Pedales
                 throttle = None
                 brake = None
                 if "throttle" in drv:
@@ -738,7 +825,6 @@ class TelemetryUI:
 
     # -------------------- Gráficas pedales --------------------
     def update_pedal_graphs(self, throttle: float, brake: float):
-        # Si está congelada, no repintamos (quedan los últimos)
         if self.freeze_ui:
             return
         try:
