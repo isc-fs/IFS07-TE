@@ -3,14 +3,16 @@
 ISCmetrics - Real-Time Telemetry UI
 - Fullscreen dark UI
 - Select COM port & baudrate
-- Optional InfluxDB (Option A backend)
+- Optional InfluxDB
 - Excel logging to ./logs via backend
 - Debug toggle that streams backend logs into the UI
 
-NOVEDADES UI (robustez):
-- Badge LIVE / STALE / TEST / BAD en la cabecera (colores y motivo)
-- Si STALE/TEST/BAD: se "congela" la UI (no actualiza números ni gráficas) y se atenúan
-- Panel 'ACELERADOR' con Raw1/Raw2, Escalado y Clamped (0..100 %)
+NOVEDADES UI:
+- Badge LIVE / STALE / BAD en cabecera (con motivo)
+- Congelación de widgets cuando STALE/BAD
+- Muestra acum temp max (0x640 v3) y, si llega 0x645, muestra sondas DS18B20 (t1..t4, avg)
+- Mapea temps de inversor desde 0x610 (motor, IGBT, aire), y rpm/corriente actuales
+- 4 gráficas compactas: Acelerador, Freno, DC Bus Voltage y DS Temp (avg)
 """
 
 import os
@@ -25,7 +27,7 @@ from tkinter import ttk, messagebox
 import logging
 
 # Backend
-import ISC_RTT_serial as ISC_RTT
+import ISC_RTT_serial as RTTT
 
 # ---- Matplotlib in Tk ----
 import matplotlib
@@ -49,9 +51,9 @@ if sys.platform.startswith("linux") and "DISPLAY" not in os.environ:
 
 
 # -------- Tunables for header logo & spacing --------
-LOGO_MAX_HEIGHT = 44   # compact header logo height
-LOGO_VPAD_PX    = 6    # transparent vertical padding inside the image
-ROW0_PADY       = 2    # header top/bottom padding
+LOGO_MAX_HEIGHT = 44
+LOGO_VPAD_PX    = 6
+ROW0_PADY       = 2
 ROW1_PADY       = (2, 0)
 ROW2_PADY       = (0, 6)
 GRAPHS_PADY     = 4
@@ -60,19 +62,13 @@ STATUS_PADY     = 0
 
 # -------- path + platform helpers --------
 def resource_path(*parts):
-    """
-    Robust path resolver:
-    - Dev mode: relative to this file's directory
-    - PyInstaller: uses sys._MEIPASS when present
-    - Also tries project subfolder 'ISC_REAL_TIME_25' and CWD as fallbacks
-    """
     candidates = []
     try:
         base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         candidates.append(os.path.join(base, *parts))
     except Exception:
         pass
-    candidates.append(os.path.join("ISC_REAL_TIME_25", *parts))   # legacy folder
+    candidates.append(os.path.join("ISC_REAL_TIME_25", *parts))   # legacy
     candidates.append(os.path.join(os.getcwd(), *parts))           # cwd fallback
     for c in candidates:
         if os.path.exists(c):
@@ -85,10 +81,6 @@ def is_windows():
 
 
 def load_logo_with_padding(png_path, max_h=LOGO_MAX_HEIGHT, vpad_px=LOGO_VPAD_PX):
-    """
-    Load PNG, scale by height (preserving aspect), add transparent vertical padding.
-    Returns a PIL.Image or None if PIL isn't available.
-    """
     if not (Image and ImageTk):
         return None
     img = Image.open(png_path).convert("RGBA")
@@ -138,20 +130,19 @@ class TelemetryUI:
         self.root.attributes("-fullscreen", True)
         self.root.configure(bg="#101010")
 
-        # Early log buffer (avoid using log widget before it exists)
+        # Early log buffer
         self._early_logs = []
 
         # Keep references to images
         self.tk_logo = None
 
         self.setup_data_structures()
-        self.setup_ui()               # builds header, controls, displays (log widget)
-        self._flush_early_logs()      # now the log widget exists
-        self.setup_logging_bridge()   # route backend logger into UI
+        self.setup_ui()
+        self._flush_early_logs()
+        self.setup_logging_bridge()
 
     # -------------------- Early logging helpers --------------------
     def _elog(self, message: str):
-        """Safe early log: buffer until telemetry_display exists + print to stdout."""
         try:
             print(message)
         except Exception:
@@ -174,10 +165,13 @@ class TelemetryUI:
         self.receiving_thread = None
         self.ui_update_thread = None
 
-        # Historias para plots
-        self.throttle_history = deque(maxlen=200)
-        self.brake_history = deque(maxlen=200)
-        self.time_history = deque(maxlen=200)
+        # Historias para plots (compactas)
+        self.maxlen_hist = 240  # ~24 s a 10 Hz aprox
+        self.throttle_history = deque(maxlen=self.maxlen_hist)
+        self.brake_history    = deque(maxlen=self.maxlen_hist)
+        self.vdc_history      = deque(maxlen=self.maxlen_hist)
+        self.dsavg_history    = deque(maxlen=self.maxlen_hist)
+        self.time_history     = deque(maxlen=self.maxlen_hist)
 
         # Listas demo
         self.pilots_list = ["J. Landa", "N. Huertas", "A. Sanchez", "F. Tobar"]
@@ -201,15 +195,22 @@ class TelemetryUI:
 
     # -------------------- UI raíz --------------------
     def setup_ui(self):
-        # Grid root
+        # Grid root (da más peso a la fila de gráficas para evitar recortes)
         for i in range(9):
             self.root.grid_columnconfigure(i, weight=1)
-        for i in range(8):
-            self.root.grid_rowconfigure(i, weight=1)
+        # Rows: 0 header, 1 selects, 2 io, 3-4 panels, 5 graphs, 6 log, 7 status
+        self.root.grid_rowconfigure(0, weight=0)
+        self.root.grid_rowconfigure(1, weight=0)
+        self.root.grid_rowconfigure(2, weight=0)
+        self.root.grid_rowconfigure(3, weight=0)
+        self.root.grid_rowconfigure(4, weight=0)
+        self.root.grid_rowconfigure(5, weight=2)  # más espacio para gráficas
+        self.root.grid_rowconfigure(6, weight=1)
+        self.root.grid_rowconfigure(7, weight=0)
 
         self.create_header()
         self.create_controls()
-        self.create_data_displays()   # creates self.telemetry_display
+        self.create_data_displays()
         self.create_graphs()
         self.create_statusbar()
         self.setup_bindings()
@@ -222,29 +223,23 @@ class TelemetryUI:
         self.root.bind("<F11>", self.toggle_fullscreen)
         self.root.bind("<Control-m>", lambda e: self.minimize_window())
 
-    # -------------------- Cabecera (top-left logo + title) --------------------
+    # -------------------- Cabecera --------------------
     def create_header(self):
-        """
-        Header layout:
-        [ left_group: logo + "ISCmetrics" ] | [ spacer ] | [ right controls ]
-        """
         header_bar = tk.Frame(self.root, bg="#101010")
         header_bar.grid(row=0, column=0, columnspan=9, sticky="ew", pady=ROW0_PADY, padx=10)
-        header_bar.grid_columnconfigure(0, weight=0)  # left anchored
-        header_bar.grid_columnconfigure(1, weight=1)  # spacer
-        header_bar.grid_columnconfigure(2, weight=0)  # right controls
+        header_bar.grid_columnconfigure(0, weight=0)
+        header_bar.grid_columnconfigure(1, weight=1)
+        header_bar.grid_columnconfigure(2, weight=0)
 
         left_group = tk.Frame(header_bar, bg="#101010")
         left_group.grid(row=0, column=0, sticky="nw")
-
         right_frame = tk.Frame(header_bar, bg="#101010")
         right_frame.grid(row=0, column=2, sticky="ne")
 
-        # ---- Resolve assets
+        # Resolve assets
         ico_path = resource_path("isc_logo.ico")
         png_path = resource_path("isc_logo.png")
 
-        # Windows taskbar icon (.ico)
         if is_windows() and os.path.exists(ico_path):
             try:
                 self.root.iconbitmap(ico_path)
@@ -252,7 +247,6 @@ class TelemetryUI:
             except Exception as e:
                 self._elog(f"[ICON] iconbitmap failed: {e}")
 
-        # ---- Header logo image (small, aspect preserved, padded)
         self.tk_logo = None
         if os.path.exists(png_path):
             try:
@@ -260,27 +254,19 @@ class TelemetryUI:
                     pil_img = load_logo_with_padding(png_path, LOGO_MAX_HEIGHT, LOGO_VPAD_PX)
                     if pil_img is None:
                         self.tk_logo = tk.PhotoImage(file=png_path)
-                        self._elog(f"[ICON] PNG via Tk PhotoImage (no PIL): {png_path} -> {self.tk_logo.width()}x{self.tk_logo.height()}")
                     else:
                         self.tk_logo = ImageTk.PhotoImage(pil_img)
-                        self._elog(f"[ICON] PNG via Pillow (small, padded): {png_path} -> {self.tk_logo.width()}x{self.tk_logo.height()}")
                 else:
-                    # Fallback without PIL (no resize/padding)
                     self.tk_logo = tk.PhotoImage(file=png_path)
-                    self._elog(f"[ICON] PNG via Tk PhotoImage (no PIL): {png_path} -> {self.tk_logo.width()}x{self.tk_logo.height()}")
             except Exception as e:
                 self._elog(f"[ICON] Failed to load PNG logo: {png_path} ({e})")
-        else:
-            self._elog(f"[ICON] PNG not found: {png_path}")
 
-        # Set window iconphoto on all platforms (in addition to iconbitmap on Win)
         if self.tk_logo:
             try:
                 self.root.iconphoto(True, self.tk_logo)
             except Exception as e:
                 self._elog(f"[ICON] iconphoto failed: {e}")
 
-        # ---- Left: logo + title (tight spacing, top-left anchored)
         if self.tk_logo:
             tk.Label(left_group, image=self.tk_logo, bg="#101010").pack(side="left")
         else:
@@ -296,7 +282,7 @@ class TelemetryUI:
         )
         title_lbl.pack(side="left")
 
-        # ---- Right side controls (badge + buttons)
+        # Right side controls (badge + buttons)
         self.badge_label = tk.Label(
             right_frame, textvariable=self.link_badge, font=("Inter", 11, "bold"),
             fg="#000000", bg="#808080", padx=8, pady=3, relief="flat", width=8
@@ -323,14 +309,12 @@ class TelemetryUI:
         )
         btn_close.pack(side="left")
 
-        # Debug info (buffered until log exists)
         self._elog(f"[ICON] CWD: {os.getcwd()}")
         self._elog(f"[ICON] Resolved ICO: {ico_path} (exists={os.path.exists(ico_path)})")
         self._elog(f"[ICON] Resolved PNG: {png_path} (exists={os.path.exists(png_path)})")
 
     # -------------------- Controles superiores --------------------
     def create_controls(self):
-        # Selects (fila 1) — tighter padding to pull UI up
         selects_frame = tk.Frame(self.root, bg="#101010")
         selects_frame.grid(row=1, column=0, columnspan=9, sticky="n", pady=ROW1_PADY)
 
@@ -353,11 +337,10 @@ class TelemetryUI:
         self.circuit_menu.config(font=("Inter", 12), fg="#00FF00", bg="#202020", highlightthickness=0, bd=0)
         self.circuit_menu.grid(row=1, column=1, padx=8, pady=(0, 6), sticky="ew")
 
-        # Puerto serie + Baud + Influx + Debug (fila 2)
+        # Puerto serie + Baud + Influx + Debug
         io_frame = tk.Frame(self.root, bg="#101010")
         io_frame.grid(row=2, column=0, columnspan=9, sticky="n", pady=ROW2_PADY)
 
-        # Puerto
         tk.Label(io_frame, text="Puerto", font=("Inter", 12), fg="#FFFFFF", bg="#101010").grid(
             row=0, column=0, padx=(0, 6), pady=2
         )
@@ -371,14 +354,12 @@ class TelemetryUI:
         )
         btn_refresh.grid(row=0, column=2, padx=(0, 12), pady=2)
 
-        # Baud
         tk.Label(io_frame, text="Baud", font=("Inter", 12), fg="#FFFFFF", bg="#101010").grid(
             row=0, column=3, padx=(0, 6), pady=2
         )
         self.baud_entry = tk.Entry(io_frame, textvariable=self.selected_baud, width=10, bg="#202020", fg="#00FF00")
         self.baud_entry.grid(row=0, column=4, padx=(0, 12), pady=2)
 
-        # Influx toggle
         self.influx_chk = tk.Checkbutton(
             io_frame, text="Usar InfluxDB", variable=self.use_influx_var,
             onvalue=True, offvalue=False, font=("Inter", 12),
@@ -387,7 +368,6 @@ class TelemetryUI:
         )
         self.influx_chk.grid(row=0, column=5, padx=(0, 12), pady=2, sticky="w")
 
-        # Debug toggle
         self.debug_chk = tk.Checkbutton(
             io_frame, text="Debug", variable=self.debug_var,
             onvalue=True, offvalue=False, font=("Inter", 12),
@@ -396,7 +376,6 @@ class TelemetryUI:
         )
         self.debug_chk.grid(row=0, column=6, padx=(0, 12), pady=2, sticky="w")
 
-        # Botones iniciar / parar
         self.run_button = tk.Button(
             io_frame, text="INICIAR", font=("Inter", 14, "bold"),
             fg="#FFFFFF", bg="#006400", command=self.start_receiving, relief="raised", bd=2, width=12
@@ -410,7 +389,6 @@ class TelemetryUI:
         )
         self.stop_button.grid(row=0, column=8, padx=6)
 
-        # Extra row: open logs (reduced spacing)
         tools_frame = tk.Frame(self.root, bg="#101010")
         tools_frame.grid(row=2, column=0, columnspan=9, sticky="s", pady=(12, 0))
         open_logs_btn = tk.Button(
@@ -458,6 +436,23 @@ class TelemetryUI:
                                             font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.temp_inverter_label.pack(pady=2)
 
+        self.temp_air_label = tk.Label(temp_frame, text="Aire: -- °C",
+                                       font=("Inter", 12), fg="#AAAAAA", bg="#101010")
+        self.temp_air_label.pack(pady=2)
+
+        # DS18B20 detail (if 0x645 present)
+        self.ds_box = tk.Frame(temp_frame, bg="#101010")
+        self.ds_box.pack(pady=(6, 2), fill="x")
+        self.ds_labels = []
+        for i in range(4):
+            lbl = tk.Label(self.ds_box, text=f"DS{i+1}: -- °C", font=("Inter", 11),
+                           fg="#CCCCCC", bg="#101010")
+            lbl.grid(row=0, column=i, padx=6)
+            self.ds_labels.append(lbl)
+        self.ds_summary_label = tk.Label(temp_frame, text="DS avg: -- °C",
+                                         font=("Inter", 11), fg="#BBBBBB", bg="#101010")
+        self.ds_summary_label.pack(pady=(2, 0))
+
         # ESTADO INVERSOR
         inverter_frame = tk.LabelFrame(self.root, text="ESTADO INVERSOR",
                                        font=("Inter", 12, "bold"), fg="#FF6B6B",
@@ -471,6 +466,10 @@ class TelemetryUI:
         self.inverter_errors_label = tk.Label(inverter_frame, text="Errores: --",
                                               font=("Inter", 12), fg="#FFFFFF", bg="#101010")
         self.inverter_errors_label.pack(pady=2)
+
+        self.n_i_label = tk.Label(inverter_frame, text="n_actual: -- rpm | i_actual: -- A",
+                                  font=("Inter", 12), fg="#FFFFFF", bg="#101010")
+        self.n_i_label.pack(pady=2)
 
         # TORQUE
         torque_frame = tk.LabelFrame(self.root, text="TORQUE",
@@ -486,7 +485,7 @@ class TelemetryUI:
                                          font=("Inter", 14), fg="#FFFFFF", bg="#101010")
         self.torque_est_label.pack(pady=2)
 
-        # ACELERADOR (nuevo: raw/escalado/clamped)
+        # ACELERADOR (raw/escalado/clamped)
         accel_frame = tk.LabelFrame(self.root, text="ACELERADOR",
                                     font=("Inter", 12, "bold"), fg="#00BFFF",
                                     bg="#101010", bd=2)
@@ -508,34 +507,49 @@ class TelemetryUI:
         log_frame.grid(row=6, column=0, columnspan=9, padx=5, pady=4, sticky="nsew")
 
         self.telemetry_display = st.ScrolledText(
-            log_frame, width=100, height=12, font=("Consolas", 10),
+            log_frame, width=100, height=10, font=("Consolas", 10),
             bg="#1a1a1a", fg="#00FF00"
         )
         self.telemetry_display.pack(fill="both", expand=True, padx=5, pady=5)
 
-    # -------------------- Gráficos --------------------
+    # -------------------- Gráficos (4 compactos) --------------------
     def create_graphs(self):
         graphs_frame = tk.Frame(self.root, bg="#101010")
         graphs_frame.grid(row=5, column=0, columnspan=9, padx=5, pady=GRAPHS_PADY, sticky="nsew")
 
         plt.style.use("dark_background")
-        self.fig = Figure(figsize=(12, 4), facecolor="#101010")
+        # Figura más chata + layout automático para evitar recortes
+        self.fig = Figure(figsize=(12, 3.2), facecolor="#101010", constrained_layout=True)
 
-        self.ax_throttle = self.fig.add_subplot(121)
-        self.ax_throttle.set_title("ACELERADOR (%)", color="white", fontsize=12, fontweight="bold")
+        gs = self.fig.add_gridspec(2, 2)
+        self.ax_throttle = self.fig.add_subplot(gs[0, 0])
+        self.ax_brake    = self.fig.add_subplot(gs[0, 1])
+        self.ax_vdc      = self.fig.add_subplot(gs[1, 0])
+        self.ax_dsavg    = self.fig.add_subplot(gs[1, 1])
+
+        # Config común
+        for ax in (self.ax_throttle, self.ax_brake, self.ax_vdc, self.ax_dsavg):
+            ax.set_facecolor("#1a1a1a")
+            ax.grid(True, alpha=0.3)
+
+        # Límites/títulos compactos
+        self.ax_throttle.set_title("ACELERADOR (%)", color="white", fontsize=10, fontweight="bold")
         self.ax_throttle.set_ylim(0, 100)
-        self.ax_throttle.set_facecolor("#1a1a1a")
-        self.ax_throttle.grid(True, alpha=0.3)
 
-        self.ax_brake = self.fig.add_subplot(122)
-        self.ax_brake.set_title("FRENO (%)", color="white", fontsize=12, fontweight="bold")
+        self.ax_brake.set_title("FRENO (%)", color="white", fontsize=10, fontweight="bold")
         self.ax_brake.set_ylim(0, 100)
-        self.ax_brake.set_facecolor("#1a1a1a")
-        self.ax_brake.grid(True, alpha=0.3)
+
+        self.ax_vdc.set_title("DC BUS (V)", color="white", fontsize=10, fontweight="bold")
+        # Limite inicial razonable (auto-ajuste si se sale)
+        self.ax_vdc.set_ylim(0, 420)
+
+        self.ax_dsavg.set_title("DS TEMP AVG (°C)", color="white", fontsize=10, fontweight="bold")
+        self.ax_dsavg.set_ylim(0, 90)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=graphs_frame)
         self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        widget = self.canvas.get_tk_widget()
+        widget.pack(fill="both", expand=True)
 
     # -------------------- Statusbar --------------------
     def create_statusbar(self):
@@ -552,7 +566,6 @@ class TelemetryUI:
 
     # -------------------- Logging bridge --------------------
     def setup_logging_bridge(self):
-        """Route backend logger into the UI text area."""
         self.tk_log_handler = TkTextHandler(self.telemetry_display)
         formatter = logging.Formatter("%(levelname)s - %(name)s - %(message)s")
         self.tk_log_handler.setFormatter(formatter)
@@ -561,7 +574,6 @@ class TelemetryUI:
         self.backend_logger.addHandler(self.tk_log_handler)
         self._apply_debug_level()
 
-        # Flush anything buffered before the log existed
         self._flush_early_logs()
 
     def _apply_debug_level(self):
@@ -584,7 +596,7 @@ class TelemetryUI:
 
     # -------------------- Puerto serie helpers --------------------
     def refresh_ports(self):
-        ports = ISC_RTT.list_serial_ports()
+        ports = RTTT.list_serial_ports()
         self.port_combo["values"] = [dev for dev, _ in ports]
         if not self.selected_port.get():
             autodet = self._auto_pick_port_from_list(ports)
@@ -622,17 +634,17 @@ class TelemetryUI:
         try:
             # Reset flags
             self.stop_data = False
-            ISC_RTT.new_data_flag = 0
+            RTTT.new_data_flag = 0
             self.receiving_flag = True
 
             piloto = self.piloto_var.get()
             circuito = self.circuito_var.get()
 
-            bucket_id = ISC_RTT.create_bucket(piloto, circuito, use_influx=use_influx)
+            bucket_id = RTTT.create_bucket(piloto, circuito, use_influx=use_influx)
 
             # Thread RX
             self.receiving_thread = threading.Thread(
-                target=ISC_RTT.receive_data,
+                target=RTTT.receive_data,
                 args=(bucket_id, piloto, circuito, port, baud, use_influx, debug_mode),
                 daemon=True
             )
@@ -662,7 +674,7 @@ class TelemetryUI:
 
         try:
             self.stop_data = True
-            ISC_RTT.new_data_flag = -1
+            RTTT.new_data_flag = -1
             self.receiving_flag = False
 
             if self.receiving_thread and self.ui_update_thread:
@@ -683,13 +695,13 @@ class TelemetryUI:
     def update_ui_thread(self):
         while not self.stop_data:
             try:
-                if ISC_RTT.new_data_flag == 1:
-                    latest_data = ISC_RTT.get_latest_data()
+                if RTTT.new_data_flag == 1:
+                    latest_data = RTTT.get_latest_data()
                     self.root.after(0, self.update_badge_and_freeze, latest_data.get("__STATUS__", {}))
                     if latest_data:
                         self.root.after(0, self.update_data_displays, latest_data)
-                    self.root.after(0, self.log_message, ISC_RTT.data_str)
-                    ISC_RTT.new_data_flag = 0
+                    self.root.after(0, self.log_message, RTTT.data_str)
+                    RTTT.new_data_flag = 0
                 time.sleep(0.01)
             except Exception as e:
                 self.root.after(0, self.log_message, f"Error actualizando UI: {e}")
@@ -705,7 +717,6 @@ class TelemetryUI:
         color_map = {
             "LIVE": "#00FF00",
             "STALE": "#BFBF00",
-            "TEST": "#FF8C00",
             "BAD": "#FF3333",
         }
         bg = color_map.get(badge, "#808080")
@@ -720,8 +731,8 @@ class TelemetryUI:
 
         labels = [
             self.accu_voltage_label, self.accu_current_label, self.accu_power_label,
-            self.temp_accu_label, self.temp_motor_label, self.temp_inverter_label,
-            self.inverter_status_label, self.inverter_errors_label,
+            self.temp_accu_label, self.temp_motor_label, self.temp_inverter_label, self.temp_air_label,
+            self.inverter_status_label, self.inverter_errors_label, self.n_i_label,
             self.torque_req_label, self.torque_est_label,
             self.accel_raw1_label, self.accel_raw2_label,
             self.accel_scaled_label, self.accel_clamped_label,
@@ -734,125 +745,176 @@ class TelemetryUI:
 
         tcolor = fg_dim if dim else "#FFFFFF"
         try:
-            self.ax_throttle.set_title("ACELERADOR (%)", color=tcolor, fontsize=12, fontweight="bold")
-            self.ax_brake.set_title("FRENO (%)", color=tcolor, fontsize=12, fontweight="bold")
+            for ax in (self.ax_throttle, self.ax_brake, self.ax_vdc, self.ax_dsavg):
+                ax.title.set_color(tcolor)
             self.canvas.draw()
         except Exception:
             pass
 
-    # -------------------- Render de datos --------------------
+    # -------------------- Render de datos + gráficas --------------------
     def update_data_displays(self, data: dict):
         if self.freeze_ui:
             return
         try:
-            # ACCUMULATOR (0x640)
+            # Track values for graphs (may be None)
+            g_throttle = None
+            g_brake = None
+            g_vdc = None
+            g_dsavg = None
+
+            # 0x640 — Accumulator summary
             if "0x640" in data:
                 accu = data["0x640"]
                 if "current_sensor" in accu:
                     self.accu_current_label.config(text=f"Corriente: {accu['current_sensor']:.1f} A")
                 if "cell_min_v" in accu:
+                    # Si tu 0x640 v2 era otra cosa, mantenemos DC Bus desde 0x600 (abajo)
                     self.accu_voltage_label.config(text=f"Voltaje Min: {accu['cell_min_v']:.2f} V")
                 if "cell_max_temp" in accu:
                     temp = float(accu["cell_max_temp"])
                     color = "#FF0000" if temp > 50 else "#FFA500" if temp > 40 else "#FFFFFF"
                     self.temp_accu_label.config(text=f"Accu Max: {temp:.1f} °C", fg=color if not self.freeze_ui else "#888888")
 
-            # POWERTRAIN (0x620)
-            if "0x620" in data:
-                pt = data["0x620"]
-                if "dc_bus_voltage" in pt:
-                    self.accu_voltage_label.config(text=f"DC Bus: {pt['dc_bus_voltage']:.1f} V")
-                if "dc_bus_power" in pt:
-                    self.accu_power_label.config(text=f"Potencia: {pt['dc_bus_power']:.1f} W")
-                if "motor_temp" in pt:
-                    self.temp_motor_label.config(text=f"Motor: {pt['motor_temp']:.1f} °C")
-                if "pwrstg_temp" in pt:
-                    self.temp_inverter_label.config(text=f"Inversor: {pt['pwrstg_temp']:.1f} °C")
+            # 0x610 — Inverter temps & currents
+            if "0x610" in data:
+                inv = data["0x610"]
+                if "motor_temp" in inv:
+                    self.temp_motor_label.config(text=f"Motor: {inv['motor_temp']:.1f} °C")
+                if "pwrstg_temp" in inv:
+                    self.temp_inverter_label.config(text=f"Inversor: {inv['pwrstg_temp']:.1f} °C")
+                if "air_temp" in inv:
+                    self.temp_air_label.config(text=f"Aire: {inv['air_temp']:.1f} °C")
+                # n_actual / i_actual
+                ntext = f"n_actual: {inv.get('n_actual','--'):.0f} rpm" if isinstance(inv.get('n_actual'), (int,float)) else "n_actual: -- rpm"
+                itext = f"i_actual: {inv.get('i_actual','--'):.1f} A" if isinstance(inv.get('i_actual'), (int,float)) else "i_actual: -- A"
+                self.n_i_label.config(text=f"{ntext} | {itext}")
 
-            # INVERTER STATUS (0x680)
+            # 0x680 — Inverter status/errors
             if "0x680" in data:
-                inv = data["0x680"]
-                if "status" in inv:
-                    status = int(inv["status"])
+                invs = data["0x680"]
+                if "status" in invs:
+                    status = int(invs["status"])
                     status_text = "CONECTADO" if status == 1 else "DESCONECTADO"
                     status_color = "#00FF00" if status == 1 else "#FF0000"
                     self.inverter_status_label.config(text=f"Estado: {status_text}",
                                                       fg=status_color if not self.freeze_ui else "#888888")
-                if "errors" in inv:
-                    errors = int(inv["errors"])
+                if "errors" in invs:
+                    errors = int(invs["errors"])
                     error_color = "#FF0000" if errors > 0 else "#FFFFFF"
                     self.inverter_errors_label.config(text=f"Errores: {errors}",
                                                       fg=error_color if not self.freeze_ui else "#888888")
 
-            # DRIVER INPUTS (0x630)
+            # 0x630 — Driver inputs summary
             if "0x630" in data:
                 drv = data["0x630"]
                 if "torque_req" in drv:
                     self.torque_req_label.config(text=f"Solicitado: {drv['torque_req']:.1f} Nm")
                 if "torque_est" in drv:
                     self.torque_est_label.config(text=f"Estimado: {drv['torque_est']:.1f} Nm")
-                throttle = None
-                brake = None
                 if "throttle" in drv:
-                    throttle = float(drv["throttle"])
+                    g_throttle = float(drv["throttle"])
+                    self.accel_scaled_label.config(text=f"Escalado: {g_throttle:.2f} %")
+                    self.accel_clamped_label.config(text=f"Clamped:  {max(0.0, min(100.0, g_throttle)):.2f} %")
                 if "brake" in drv:
-                    brake = float(drv["brake"])
-                if throttle is not None and brake is not None:
-                    self.update_pedal_graphs(throttle, brake)
+                    g_brake = float(drv["brake"])
 
-            # ACELERADOR – raw/escalado/clamped (fuente 0x600 y 0x630)
-            raw1 = raw2 = None
-            scaled = None
+            # 0x600 — raw throttle + DC Bus
             if "0x600" in data:
                 m600 = data["0x600"]
-                raw1 = m600.get("throttle_raw1", None)
-                raw2 = m600.get("throttle_raw2", None)
-            if "0x630" in data:
-                m630 = data["0x630"]
-                scaled = m630.get("throttle", None)
+                if "throttle_raw1" in m600:
+                    self.accel_raw1_label.config(text=f"Raw1: {m600['throttle_raw1']:.2f}")
+                if "throttle_raw2" in m600:
+                    self.accel_raw2_label.config(text=f"Raw2: {m600['throttle_raw2']:.2f}")
+                if "dc_bus_power" in m600:
+                    self.accu_power_label.config(text=f"Potencia: {m600['dc_bus_power']:.1f} W")
+                if "dc_bus_voltage" in m600:
+                    vdc = float(m600["dc_bus_voltage"])
+                    self.accu_voltage_label.config(text=f"DC Bus: {vdc:.1f} V")
+                    g_vdc = vdc
 
-            if raw1 is not None:
-                self.accel_raw1_label.config(text=f"Raw1: {raw1:.2f}")
-            if raw2 is not None:
-                self.accel_raw2_label.config(text=f"Raw2: {raw2:.2f}")
-            if scaled is not None:
-                clamped = max(0.0, min(100.0, float(scaled)))
-                self.accel_scaled_label.config(text=f"Escalado: {scaled:.2f} %")
-                self.accel_clamped_label.config(text=f"Clamped:  {clamped:.2f} %")
+            # 0x645 — detalle DS18B20 (avg preferente)
+            if "0x645" in data:
+                ds = data["0x645"]
+                temps = [ds.get("ds_t1"), ds.get("ds_t2"), ds.get("ds_t3"), ds.get("ds_t4")]
+                for i, t in enumerate(temps):
+                    if isinstance(t, (int, float)):
+                        self.ds_labels[i].config(text=f"DS{i+1}: {t:.1f} °C")
+                dsavg = ds.get("ds_avg")
+                if isinstance(dsavg, (int, float)):
+                    self.ds_summary_label.config(text=f"DS avg: {dsavg:.1f} °C")
+                    g_dsavg = float(dsavg)
+                else:
+                    # calcular media de las disponibles si no viene ds_avg
+                    vals = [float(t) for t in temps if isinstance(t, (int, float))]
+                    if vals:
+                        g_dsavg = sum(vals) / len(vals)
+                        self.ds_summary_label.config(text=f"DS avg: {g_dsavg:.1f} °C")
+
+            # Actualiza las 4 gráficas compactas
+            self.update_graphs(g_throttle, g_brake, g_vdc, g_dsavg)
 
         except Exception as e:
             self.log_message(f"Error actualizando displays: {e}")
 
-    # -------------------- Gráficas pedales --------------------
-    def update_pedal_graphs(self, throttle: float, brake: float):
+    # -------------------- Gráficas 2×2 compactas --------------------
+    def update_graphs(self, throttle=None, brake=None, vdc=None, dsavg=None):
         if self.freeze_ui:
             return
         try:
             t_now = time.time()
-            self.throttle_history.append(float(throttle))
-            self.brake_history.append(float(brake))
             self.time_history.append(t_now)
 
-            self.ax_throttle.clear()
-            self.ax_brake.clear()
+            # Acumula sólo si hay dato nuevo
+            if throttle is not None:
+                self.throttle_history.append(float(throttle))
+            else:
+                self.throttle_history.append(self.throttle_history[-1] if self.throttle_history else 0.0)
 
-            self.ax_throttle.set_title("ACELERADOR (%)", color="white", fontsize=12, fontweight="bold")
-            self.ax_throttle.set_ylim(0, 100)
-            self.ax_throttle.set_facecolor("#1a1a1a")
-            self.ax_throttle.grid(True, alpha=0.3)
+            if brake is not None:
+                self.brake_history.append(float(brake))
+            else:
+                self.brake_history.append(self.brake_history[-1] if self.brake_history else 0.0)
 
-            self.ax_brake.set_title("FRENO (%)", color="white", fontsize=12, fontweight="bold")
-            self.ax_brake.set_ylim(0, 100)
-            self.ax_brake.set_facecolor("#1a1a1a")
-            self.ax_brake.grid(True, alpha=0.3)
+            if vdc is not None:
+                self.vdc_history.append(float(vdc))
+            else:
+                self.vdc_history.append(self.vdc_history[-1] if self.vdc_history else 0.0)
 
-            if len(self.throttle_history) > 1:
+            if dsavg is not None:
+                self.dsavg_history.append(float(dsavg))
+            else:
+                self.dsavg_history.append(self.dsavg_history[-1] if self.dsavg_history else 0.0)
+
+            # Eje tiempo relativo
+            if len(self.time_history) > 1:
                 t0 = self.time_history[0]
                 ts = np.array(self.time_history) - t0
-                self.ax_throttle.plot(ts, self.throttle_history, "g-", linewidth=2)
-                self.ax_throttle.fill_between(ts, 0, self.throttle_history, alpha=0.3, color="green")
-                self.ax_brake.plot(ts, self.brake_history, "r-", linewidth=2)
-                self.ax_brake.fill_between(ts, 0, self.brake_history, alpha=0.3, color="red")
+            else:
+                ts = np.array([0.0]*len(self.time_history))
+
+            # Clear + re-draw (líneas finas para compacto)
+            for ax in (self.ax_throttle, self.ax_brake, self.ax_vdc, self.ax_dsavg):
+                ax.cla()
+                ax.set_facecolor("#1a1a1a")
+                ax.grid(True, alpha=0.3)
+
+            # Titles + limits
+            self.ax_throttle.set_title("ACELERADOR (%)", color="white", fontsize=10, fontweight="bold")
+            self.ax_throttle.set_ylim(0, 100)
+            self.ax_brake.set_title("FRENO (%)", color="white", fontsize=10, fontweight="bold")
+            self.ax_brake.set_ylim(0, 100)
+            self.ax_vdc.set_title("DC BUS (V)", color="white", fontsize=10, fontweight="bold")
+            # auto-ajuste si VDC se sale
+            vmax = max(self.vdc_history) if self.vdc_history else 100
+            self.ax_vdc.set_ylim(0, max(60, ((int(vmax/20)+1)*20)))  # múltiplos de 20
+            self.ax_dsavg.set_title("DS TEMP AVG (°C)", color="white", fontsize=10, fontweight="bold")
+            self.ax_dsavg.set_ylim(0, 90)
+
+            # Draw series (sin relleno para mantenerlas pequeñas)
+            self.ax_throttle.plot(ts, list(self.throttle_history), linewidth=1.5)
+            self.ax_brake.plot(ts, list(self.brake_history), linewidth=1.5)
+            self.ax_vdc.plot(ts, list(self.vdc_history), linewidth=1.5)
+            self.ax_dsavg.plot(ts, list(self.dsavg_history), linewidth=1.5)
 
             self.canvas.draw()
         except Exception as e:

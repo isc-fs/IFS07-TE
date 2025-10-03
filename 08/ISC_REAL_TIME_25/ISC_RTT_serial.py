@@ -1,8 +1,8 @@
-# ISC_RTT_serial.py
+
 """
 Recepción por USB-Serial desde RF-NANO (forward de NRF24L01, 32B LE)
 
-Mantiene la API esperada por tu UI:
+API (compatible con la UI):
   - new_data_flag, data_str, latest_data_dict
   - create_bucket(piloto, circuito, use_influx=False) -> bucket_id
   - receive_data(bucket_id, piloto, circuito, port=None, baud=115200, use_influx=False, debug=False)
@@ -17,6 +17,11 @@ ROBUSTEZ:
   - Chequeo monotónico de SEQ (uint16) y badge LIVE/STALE/BAD exportado a la UI:
       latest_data_dict["__STATUS__"] = {"badge": "...", "reason": "...", "ts": epoch_ms}
   - Excel por sesión en ./logs (una fila por frame válido no-TEST)
+
+NOVEDADES:
+  - Mapeo correcto de 0x610 (temps/corrientes de inversor)
+  - 0x640: Accumulator summary (v3 = DS18B20 t_max)
+  - 0x645 (opcional): Detalle DS18B20 (v1..v4 = sondas, v5=avg, v6=max, v7=count)
 """
 
 from __future__ import annotations
@@ -51,7 +56,7 @@ INFLUX_CONFIG = {
 }
 INFLUX_ENABLE_DEFAULT = False   # <-- por defecto DESACTIVADO
 
-_client = None          # se crea perezosamente
+_client = None
 _influx_ok = False
 
 def _init_influx():
@@ -155,9 +160,7 @@ def _is_consecutive_ramp(payload: bytes) -> bool:
     return all(((payload[i] - payload[i-1]) & 0xFF) == 1 for i in range(1, PAYLOAD_LEN))
 
 def is_test_payload(payload: bytes) -> bool:
-    """
-    Considera TEST si es exactamente A0..BF o si es una rampa consecutiva.
-    """
+    """Considera TEST si es exactamente A0..BF o si es una rampa consecutiva."""
     return payload == TEST_PATTERN or _is_consecutive_ramp(payload)
 
 def _read_frame(ser, counters=None):
@@ -291,37 +294,67 @@ def parse_telemetry_data_frame(frame_dict: dict):
         "v1": v1, "v2": v2, "v3": v3, "v4": v4, "v5": v5, "v6": v6, "v7": v7,
     }
 
-    # Mapeos semánticos (ajusta a tu TX real si difiere)
+    # ------- Mapeos semánticos -------
     if id_int == 0x600:
+        # Powertrain básico (según tu TX real: ajusta si difiere)
         latest_data_dict[id_hex].update({
-            "dc_bus_voltage": v1,
-            "dc_bus_power":   v2,
+            "dc_bus_voltage": v1,   # V
+            "dc_bus_power":   v2,   # W (si mapeado)
             "rpm":            v3,
             "torque_total":   v4,
             "cell_min_v":     v5,
             "throttle_raw1":  v6,
             "throttle_raw2":  v7,
         })
-        # Compat con UI que mira 0x620:
-        latest_data_dict["0x620"] = {
-            "dc_bus_voltage": v1,
-            "dc_bus_power":   v2,
-            "motor_temp":     latest_data_dict.get("0x620", {}).get("motor_temp", 0.0),
-            "pwrstg_temp":    latest_data_dict.get("0x620", {}).get("pwrstg_temp", 0.0),
-        }
+
+    elif id_int == 0x610:
+        # Inverter temps & currents (nuevo mapeo correcto)
+        latest_data_dict[id_hex].update({
+            "motor_temp":   v1,   # °C
+            "pwrstg_temp":  v2,   # °C (IGBT)
+            "air_temp":     v3,   # °C
+            "n_actual":     v4,   # rpm (o unidades del inversor)
+            "i_actual":     v5,   # A
+        })
+
+    elif id_int == 0x620:
+        # Driver inputs (si lo usas para algo adicional)
+        latest_data_dict[id_hex].update({
+            "s1_raw": v1, "s2_raw": v2,
+            "brake_raw": v3,
+            "precharge_button": v4,
+            "start_button": v5,
+        })
+
     elif id_int == 0x630:
+        # Driver “resumen”
         latest_data_dict[id_hex].update({
             "torque_req": v1,
             "torque_est": v2,
             "throttle":   max(0.0, min(100.0, v3)),
             "brake":      max(0.0, min(100.0, v4)),
         })
+
     elif id_int == 0x640:
+        # Accumulator/HV summary + t_max de DS18B20
         latest_data_dict[id_hex].update({
-            "current_sensor": v1,
-            "cell_min_v":     v2,
-            "cell_max_temp":  v3,
+            "current_sensor": v1,  # A si lo mandas
+            "cell_min_v":     v2,  # V o mV según escale tu TX
+            "cell_max_temp":  v3,  # °C (DS18B20 max)
         })
+
+    elif id_int == 0x645:
+        # Detalle DS18B20 por sonda
+        latest_data_dict[id_hex].update({
+            "ds_t1": v1,
+            "ds_t2": v2,
+            "ds_t3": v3,
+            "ds_t4": v4,
+            "ds_avg": v5,
+            "ds_max": v6,
+            "ds_count": v7,
+        })
+
     elif id_int == 0x680:
         latest_data_dict[id_hex].update({
             "status": v1,
@@ -346,7 +379,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
             pt = pt.field("seq", int(seq))
         return pt
     except Exception:
-        # Si la lib no está o falla, seguimos sin Point
         return None
 
 # ================== METADATOS / BUCKET (OPCIONAL) ==================
@@ -427,7 +459,7 @@ class ExcelSessionLogger:
             "v1": v1, "v2": v2, "v3": v3, "v4": v4, "v5": v5, "v6": v6, "v7": v7,
         }
         try:
-            # Simple (no óptimo para sesiones MUY largas): lee, concatena, reescribe
+            # Simple (no óptimo para sesiones largas): lee, concatena, reescribe
             existing = pd.read_excel(self.path, sheet_name="telemetry")
             newdf = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
             with pd.ExcelWriter(self.path, engine="openpyxl", mode="w") as writer:
@@ -575,14 +607,14 @@ def receive_data(bucket_id: str,
                             _set_badge("STALE", "SEQ detenido")
                 logger.debug("[RX] ID=%s SEQ=%d (%s)", _id_hex(decoded["id"]), seq, _status["badge"])
             else:
-                # Legacy sin SEQ: considerar LIVE al recibir, pero no podemos detectar STALE por SEQ
+                # Legacy sin SEQ
                 _set_badge("LIVE", "legacy sin SEQ")
                 logger.debug("[RX] ID=%s (legacy)", _id_hex(decoded["id"]))
 
             # Parse lógico (y Point si la lib está instalada)
             pt = parse_telemetry_data_frame(decoded)
 
-            # Además del data_str (para la UI), dejamos el detalle debug de floats
+            # Además del data_str (para la UI), deja el detalle de floats en DEBUG
             fline = ", ".join(f"{x:.2f}" for x in (
                 decoded["v1"], decoded["v2"], decoded["v3"], decoded["v4"],
                 decoded["v5"], decoded["v6"], decoded["v7"]))
