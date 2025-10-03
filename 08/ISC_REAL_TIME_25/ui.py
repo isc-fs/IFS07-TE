@@ -180,7 +180,7 @@ class TelemetryUI:
         self.time_history = deque(maxlen=200)
 
         # Listas demo
-        self.pilots_list = ["J. Landa", "M. Lorenzo", "A. Montero", "F. Tobar", "Chefo"]
+        self.pilots_list = ["J. Landa", "N. Huertas", "A. Sanchez", "F. Tobar"]
         self.circuits_list = ["Boadilla", "Jarama", "Montmeló", "Hockenheim"]
 
         # Tk variables
